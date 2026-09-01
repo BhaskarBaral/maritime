@@ -1,0 +1,33 @@
+# Virtual Environments
+venv311/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+._*
+
+# VS Code
+.vscode/
+
+# Runtime Data
+uploads/*.csv
+backend/app/services/audit_log.json
+
+# Streamlit
+# Allow theme config to be committed, ignore other local session/telemetry files
+.streamlit/*
+!.streamlit/config.toml
+
+# Environment Variables
+.env
+.env.*
+
+# Logs
+*.log
