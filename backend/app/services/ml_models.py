@@ -18,6 +18,7 @@ accuracy) so the reported number is measured against held-out data,
 not asserted.
 """
 
+import re
 import time
 import numpy as np
 import pandas as pd
@@ -77,8 +78,28 @@ def _aggregate_series(df: pd.DataFrame, commodity: str = "ALL", section: str = "
 
 
 def _facility_berths(commodity: str) -> list[str]:
+    """
+    Splits a berths string like "Berth 15 & 16" or "Oil Jetty 3 & 4" into
+    individual berth names. A naive split on "&"/"," turns "Berth 15 & 16"
+    into ["Berth 15", "16"] — the second entry silently loses its "Berth"
+    prefix. Re-attach the shared prefix when a split part is a bare number
+    (or number-led suffix like "16A").
+    """
     info = NMPA_FACILITY_MAP.get(commodity.upper(), NMPA_FACILITY_MAP["ALL"])
-    return [b.strip() for b in info["berths"].replace("&", ",").split(",") if b.strip()]
+    parts = [p.strip() for p in re.split(r",| & ", info["berths"]) if p.strip()]
+    if not parts:
+        return parts
+
+    prefix_match = re.match(r"^([A-Za-z][A-Za-z .]*?)\s+\d", parts[0])
+    prefix = prefix_match.group(1).strip() if prefix_match else None
+
+    expanded = []
+    for idx, p in enumerate(parts):
+        if idx > 0 and prefix and re.fullmatch(r"\d+[A-Za-z0-9\-]*", p):
+            expanded.append(f"{prefix} {p}")
+        else:
+            expanded.append(p)
+    return expanded
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -163,11 +184,20 @@ def _detect_series_anomalies(ts: pd.DataFrame, commodity: str, section: str, con
     if len(ts) < 12:
         return []
     t = ts.copy()
-    t["mom_pct"] = t["volume"].pct_change().fillna(0.0)
+    prev_volume = t["volume"].shift(1)
+    # MoM % is undefined (not infinite) when the prior month was zero — pandas'
+    # pct_change() silently produces `inf` there, which both corrupts the
+    # IsolationForest's feature space (an unbounded outlier value) and renders
+    # as "+inf% MoM" in the UI. Keep the true value as NaN for display/
+    # classification, and feed the model a bounded, sentinel-filled version.
+    t["mom_pct"] = np.where(prev_volume > 0, (t["volume"] - prev_volume) / prev_volume, np.nan)
+    t["resuming_from_zero"] = ((prev_volume == 0) & (t["volume"] > 0)).fillna(False)
+    mom_feature = pd.Series(t["mom_pct"]).clip(-1.0, 3.0).fillna(0.0)
+
     vessels_std = t["vessels_current"].std() or 1.0
     t["vessels_z"] = (t["vessels_current"] - t["vessels_current"].mean()) / vessels_std
 
-    X = t[["volume", "mom_pct", "vessels_z"]].values
+    X = np.column_stack([t["volume"].values, mom_feature.values, t["vessels_z"].values])
     iso = IsolationForest(n_estimators=200, contamination=contamination, random_state=RANDOM_STATE)
     flags = iso.fit_predict(X)
     scores = iso.decision_function(X)
@@ -194,9 +224,14 @@ def _detect_series_anomalies(ts: pd.DataFrame, commodity: str, section: str, con
         else:
             severity = "Low"
 
-        if row["mom_pct"] > 0.25:
+        mom_pct = row["mom_pct"]  # may be NaN — undefined, not zero, not infinite
+        resuming = bool(row["resuming_from_zero"])
+
+        if resuming:
             atype = "Cargo Surge"
-        elif row["mom_pct"] < -0.25:
+        elif pd.notna(mom_pct) and mom_pct > 0.25:
+            atype = "Cargo Surge"
+        elif pd.notna(mom_pct) and mom_pct < -0.25:
             atype = "Cargo Decline"
         elif abs(row["vessels_z"]) > 2.0:
             atype = "Vessel Congestion Spike"
@@ -214,7 +249,8 @@ def _detect_series_anomalies(ts: pd.DataFrame, commodity: str, section: str, con
             "score": score,
             "type": atype,
             "volume": float(row["volume"]),
-            "mom_pct": float(row["mom_pct"]),
+            "mom_pct": None if pd.isna(mom_pct) else float(mom_pct),
+            "resuming_from_zero": resuming,
             "vessels": float(row["vessels_current"]),
             "confidence": confidence,
         })
@@ -249,6 +285,13 @@ def detect_cargo_anomalies(limit: int = 8) -> list[dict]:
 
     events = []
     for i, r in enumerate(records[:limit]):
+        if r.get("resuming_from_zero"):
+            mom_str = "resuming after a zero-shipment month (% change undefined)"
+        elif r["mom_pct"] is not None:
+            mom_str = f"{r['mom_pct'] * 100:+.1f}% MoM"
+        else:
+            mom_str = "MoM change undefined (no prior month in series)"
+
         events.append({
             "event_id": f"ANO-{i + 1:03d}",
             "severity": r["severity"],
@@ -259,7 +302,7 @@ def detect_cargo_anomalies(limit: int = 8) -> list[dict]:
             "timestamp": r["date"].to_pydatetime().replace(tzinfo=timezone.utc).isoformat(),
             "description": (
                 f"{r['commodity']} traffic was {r['volume']:,.0f} t in {r['date'].strftime('%b %Y')} "
-                f"({r['mom_pct'] * 100:+.1f}% MoM). Isolation Forest anomaly score {r['score']:.3f} "
+                f"({mom_str}). Isolation Forest anomaly score {r['score']:.3f} "
                 f"flags this as a statistical outlier vs the port's historical distribution."
             ),
             "affected_berths": _facility_berths(r["commodity"]) if r["commodity"] != "ALL (Port-Wide)" else ["Port-Wide"],
@@ -449,5 +492,154 @@ def _predict_congestion_risk_cached() -> dict[str, Any]:
             "data/port_cargo_monthly.csv (vessel counts capped at the 97th percentile "
             "to remove data-entry outliers). Forward trajectory chains the cargo "
             "forecasting model's predicted tonnage into this classifier."
+        ),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. INCENTIVE ENGINE — real YoY trends + documented elasticity heuristic
+# ═══════════════════════════════════════════════════════════════════
+# NOT a trained ML/RL model: the dataset has no record of past incentive
+# campaigns and their outcomes, so there is nothing to fit a model against.
+# Every input (tonnage, YoY change, vessel counts) is real; the incentive %
+# and predicted-impact figures follow a fixed, disclosed elasticity formula
+# instead of a black-box prediction. There is also no tariff/pricing column
+# in the dataset, so revenue impact is reported as "not available" rather
+# than inventing a ₹/tonne conversion rate.
+
+INCENTIVE_ELASTICITY_CAPTURE = 0.30   # fraction of a YoY decline assumed recoverable via a charge cut
+INCENTIVE_ELASTICITY_PASSTHROUGH = 0.60  # fraction of the incentive % that becomes traffic-impact %
+
+
+def _latest_commodity_snapshot() -> pd.DataFrame:
+    """Most recent real month's tonnage + YoY trend per commodity (both sections combined)."""
+    df = load_cargo_dataset()
+    latest_date = df["date"].max()
+    recent = df[df["date"] == latest_date]
+    agg = recent.groupby("commodity").agg(
+        traffic_tonnes_current=("traffic_tonnes_current", "sum"),
+        traffic_tonnes_prev_year=("traffic_tonnes_prev_year", "sum"),
+        vessels_current=("vessels_current", "sum"),
+    ).reset_index()
+    agg = agg[agg["traffic_tonnes_current"] > 0].copy()
+    agg["yoy_pct"] = np.where(
+        agg["traffic_tonnes_prev_year"] > 0,
+        (agg["traffic_tonnes_current"] - agg["traffic_tonnes_prev_year"]) / agg["traffic_tonnes_prev_year"] * 100,
+        np.nan,
+    )
+    agg["latest_month"] = latest_date.strftime("%b %Y")
+    return agg.dropna(subset=["yoy_pct"])
+
+
+def generate_incentive_recommendations(top_n: int = 6) -> list[dict]:
+    """Real-data-grounded incentive recommendations from data/port_cargo_monthly.csv."""
+    agg = _latest_commodity_snapshot()
+    recs: list[dict] = []
+
+    declines = agg[agg["yoy_pct"] < -5].sort_values("yoy_pct")
+    for _, row in declines.head(max(1, top_n // 2)).iterrows():
+        commodity = row["commodity"]
+        facility = NMPA_FACILITY_MAP.get(commodity.upper(), NMPA_FACILITY_MAP["ALL"])
+        decline_pct = abs(float(row["yoy_pct"]))
+        suggested_incentive_pct = round(min(10.0, decline_pct * INCENTIVE_ELASTICITY_CAPTURE), 1)
+        predicted_recovery_pct = round(suggested_incentive_pct * INCENTIVE_ELASTICITY_PASSTHROUGH, 1)
+        recs.append({
+            "rec_id": f"INC-{re.sub(r'[^A-Z0-9]', '', commodity.upper())[:6]}",
+            "priority": "High" if decline_pct > 20 else "Medium",
+            "action": f"Offer a {suggested_incentive_pct}% handling-charge rebate on {commodity.title()}",
+            "rationale": (
+                f"{commodity} moved {row['traffic_tonnes_current']:,.0f} t in {row['latest_month']} vs "
+                f"{row['traffic_tonnes_prev_year']:,.0f} t the same month last year — a real "
+                f"{decline_pct:.1f}% YoY decline (data/port_cargo_monthly.csv, pct_variation_yoy-derived)."
+            ),
+            "current_metric": f"{commodity} YoY: {row['yoy_pct']:+.1f}%",
+            "predicted_traffic_impact": f"+{predicted_recovery_pct}%",
+            "predicted_revenue_impact": "N/A — no tariff/pricing data in dataset",
+            "confidence": round(min(0.75, 0.40 + decline_pct / 100), 2),
+            "method": (
+                f"Real YoY trend + documented elasticity heuristic (assumes {int(INCENTIVE_ELASTICITY_CAPTURE*100)}% "
+                f"of the decline is charge-recoverable, {int(INCENTIVE_ELASTICITY_PASSTHROUGH*100)}% pass-through). "
+                "Not a trained model — no historical incentive-campaign outcome data exists to fit one against."
+            ),
+            "implementation_weeks": 4,
+            "facility": facility["facility_name"],
+        })
+
+    growth = agg[agg["yoy_pct"] > 15].sort_values("yoy_pct", ascending=False)
+    for _, row in growth.head(max(1, top_n - len(recs))).iterrows():
+        commodity = row["commodity"]
+        facility = NMPA_FACILITY_MAP.get(commodity.upper(), NMPA_FACILITY_MAP["ALL"])
+        growth_pct = float(row["yoy_pct"])
+        recs.append({
+            "rec_id": f"CAP-{re.sub(r'[^A-Z0-9]', '', commodity.upper())[:6]}",
+            "priority": "High" if growth_pct > 40 else "Medium",
+            "action": f"Introduce a priority-berth premium for {commodity.title()}",
+            "rationale": (
+                f"{commodity} grew {growth_pct:+.1f}% YoY ({row['traffic_tonnes_prev_year']:,.0f} t -> "
+                f"{row['traffic_tonnes_current']:,.0f} t) with {row['vessels_current']:.0f} vessels in "
+                f"{row['latest_month']} — a real capacity-strain signal from the dataset."
+            ),
+            "current_metric": f"{commodity} YoY: {growth_pct:+.1f}%",
+            "predicted_traffic_impact": "Capacity-constrained — premium captures existing demand, doesn't create it",
+            "predicted_revenue_impact": "N/A — no tariff/pricing data in dataset",
+            "confidence": round(min(0.75, 0.40 + growth_pct / 200), 2),
+            "method": "Real YoY trend + vessel-count strain signal from data/port_cargo_monthly.csv.",
+            "implementation_weeks": 6,
+            "facility": facility["facility_name"],
+        })
+
+    return recs
+
+
+def run_incentive_monte_carlo(commodity: str, charge_delta_pct: float = -5.0,
+                               incentive_pct: float = 8.0, iterations: int = 1000) -> dict:
+    """
+    Monte Carlo simulation of a commodity's cargo volume under a proposed
+    charge/incentive change, sampled from that commodity's REAL historical
+    volume distribution (mean/std computed from data/port_cargo_monthly.csv)
+    — not a fabricated baseline. Reported in tonnes: the dataset has no
+    tariff/pricing column, so a ₹ revenue figure would have to invent a
+    conversion rate that doesn't exist in the data.
+    """
+    df = load_cargo_dataset()
+    ts = _aggregate_series(df, commodity=commodity, section="ALL")
+    if len(ts) < 6:
+        return {"error": f"Not enough historical data for '{commodity}' to run a Monte Carlo simulation."}
+
+    mean_vol = float(ts["volume"].mean())
+    std_vol = float(ts["volume"].std()) or max(1.0, mean_vol * 0.1)
+
+    # Same directional elasticity convention as the cargo What-If simulator:
+    # a charge cut (negative charge_delta_pct) and a higher incentive_pct
+    # both push demand up.
+    demand_mult = 1.0 + (incentive_pct / 100.0) * 0.6 - (charge_delta_pct / 100.0) * 0.3
+    expected_vol = max(0.0, mean_vol * demand_mult)
+
+    rng = np.random.default_rng(seed=abs(hash(commodity)) % (2 ** 31))
+    samples = np.clip(rng.normal(loc=expected_vol, scale=std_vol, size=iterations), 0, None)
+    samples.sort()
+    n = len(samples)
+
+    return {
+        "commodity": commodity,
+        "unit": "tonnes",
+        "based_on": (
+            f"Real historical monthly volume for {commodity} from data/port_cargo_monthly.csv "
+            f"(mean {mean_vol:,.0f} t, std {std_vol:,.0f} t, n={len(ts)} months)."
+        ),
+        "charge_delta_pct": charge_delta_pct,
+        "incentive_pct": incentive_pct,
+        "iterations": iterations,
+        "samples": [round(float(s), 1) for s in samples],
+        "p10": round(float(samples[int(n * 0.10)]), 1),
+        "p25": round(float(samples[int(n * 0.25)]), 1),
+        "p50": round(float(samples[int(n * 0.50)]), 1),
+        "p75": round(float(samples[int(n * 0.75)]), 1),
+        "p90": round(float(samples[int(n * 0.90)]), 1),
+        "mean": round(float(np.mean(samples)), 1),
+        "method": (
+            "Monte Carlo sampling from the commodity's real historical volume distribution, "
+            "shifted by a documented elasticity multiplier. Not ML — no historical incentive-"
+            "response data exists in the dataset to train one against."
         ),
     }

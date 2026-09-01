@@ -1,18 +1,18 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-from backend.app.services import synthetic_data as sd
+from backend.app.services import ml_models as ml
 
 router = APIRouter()
 
 class MonteCarloRequest(BaseModel):
-    scenario: str = "container_charge"
+    commodity: str = "IRON ORE"
     charge_delta: float = -5.0
     incentive_pct: float = 8.0
 
 @router.get("/recommendations")
 def get_recommendations():
-    return {"recommendations": sd.generate_incentive_recommendations()}
+    return {"recommendations": ml.generate_incentive_recommendations()}
 
 @router.post("/monte-carlo")
 def run_monte_carlo(req: MonteCarloRequest):
-    return sd.run_monte_carlo(req.scenario, req.charge_delta, req.incentive_pct)
+    return ml.run_incentive_monte_carlo(req.commodity, req.charge_delta, req.incentive_pct)

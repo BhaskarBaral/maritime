@@ -951,8 +951,17 @@ with tabs[2]:
                 for adv in sim_res.get("simulated_operational_advisories", []):
                     st.warning(adv)
 
+    elif fc_data and "error" in fc_data:
+        flow_word = {"LOADED": "export", "UNLOADED": "import", "ALL": "loaded or unloaded"}.get(selected_sec, selected_sec.lower())
+        other_section = "UNLOADED" if selected_sec == "LOADED" else ("LOADED" if selected_sec == "UNLOADED" else "ALL")
+        st.info(
+            f"📭 **No data for this combination:** {fc_data['error']}. "
+            f"This usually means **{selected_comm}** genuinely has no recorded **{flow_word}** "
+            f"activity at NMPA in the dataset — e.g. crude, LPG, fertilizer, cement, and edible "
+            f"oil are import-only at this port. Try **{other_section}** or **ALL** instead."
+        )
     else:
-        st.error("Unable to load cargo forecast payload from backend API.")
+        st.error("Unable to reach the backend API — check that the FastAPI server is running.")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1194,6 +1203,7 @@ with tabs[4]:
             ))
             fig_cong.update_layout(**PLOTLY_THEME, height=260, title="Projected Congestion Risk (chained from cargo forecast)",
                                     xaxis_title="Month", yaxis_title="Risk Score (0-10)")
+            fig_cong.update_xaxes(type="category")  # "2026-08" etc. are month labels, not a continuous date axis
             fig_cong.update_yaxes(range=[0, 11])
             st.plotly_chart(fig_cong, use_container_width=True)
 
@@ -1215,7 +1225,7 @@ with tabs[5]:
     <div class="sec-header">
       <span class="sec-title">Trade Incentive Recommendation Engine</span>
       <span class="sec-tag">Module 5</span>
-      <div class="sec-sub">RL-based policy optimization, Monte Carlo simulation, revenue maximization — proactive trade incentives</div>
+      <div class="sec-sub">Real YoY-trend recommendations + Monte Carlo volume simulation from data/port_cargo_monthly.csv — a documented elasticity heuristic, not RL (no historical incentive-response data exists to train one)</div>
     </div>""", unsafe_allow_html=True)
 
     recs_data = api_get("/incentive/recommendations") or {"recommendations": []}
@@ -1225,9 +1235,14 @@ with tabs[5]:
     with col_l:
         st.markdown('<div class="panel"><div class="panel-title">AI Recommendations — Priority Ranked</div>', unsafe_allow_html=True)
         priority_colors = {"High": "#DC2626", "Medium": "#D97706", "Strategic": "#7C3AED"}
+        def _impact_color(text):
+            return "#78716C" if (text.startswith("N/A") or "constrained" in text) else "#059669"
+
         for r in recs:
             pcolor = priority_colors.get(r["priority"], "#78716C")
             conf_pct = int(r["confidence"] * 100)
+            traffic_color = _impact_color(r["predicted_traffic_impact"])
+            revenue_color = _impact_color(r["predicted_revenue_impact"])
             st.markdown(f"""
             <div class="rec-card">
               <div style="display:flex;justify-content:space-between;align-items:flex-start;">
@@ -1239,8 +1254,8 @@ with tabs[5]:
                 <b>Current:</b> {r['current_metric']}
               </div>
               <div class="rec-impacts">
-                <div><div class="rec-impact-pos">Traffic: {r['predicted_traffic_impact']}</div></div>
-                <div><div class="rec-impact-pos">Revenue: {r['predicted_revenue_impact']}</div></div>
+                <div><div style="font-size:13px;font-weight:700;color:{traffic_color};">Traffic: {r['predicted_traffic_impact']}</div></div>
+                <div><div style="font-size:13px;font-weight:700;color:{revenue_color};">Revenue: {r['predicted_revenue_impact']}</div></div>
                 <div><div style="font-size:13px;font-weight:700;color:{GOLD};">{conf_pct}% confidence</div></div>
               </div>
               <div class="rec-meta">
@@ -1251,39 +1266,49 @@ with tabs[5]:
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_r:
-        st.markdown("**Monte Carlo Policy Simulator**")
+        st.markdown("**Monte Carlo Volume Simulator**")
         st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.caption("Samples from the selected commodity's real historical volume distribution — no tariff data exists in the dataset, so this simulates cargo tonnage, not revenue.")
+
+        mc_meta = api_get("/cargo/commodities") or {}
+        mc_status = mc_meta.get("commodity_status", {})
+        mc_commodities = sorted(
+            c for c in mc_meta.get("commodities", []) if c != "ALL" and mc_status.get(c, {}).get("is_current", False)
+        ) or ["IRON ORE"]
+
+        mc_commodity = st.selectbox("Commodity", mc_commodities, index=0)
         charge_delta = st.slider("Handling Charge Change (%)", min_value=-15.0, max_value=5.0, value=-5.0, step=0.5)
         incentive_pct = st.slider("Incentive Rate Offered (%)", min_value=0.0, max_value=15.0, value=8.0, step=0.5)
-        scenario_name = st.selectbox("Scenario Type", ["container_charge", "lng_priority", "coal_volume", "auto_terminal"])
 
         if st.button("Run Monte Carlo Simulation (1000 iterations)"):
             with st.spinner("Running Monte Carlo..."):
                 mc_result = api_post("/incentive/monte-carlo", {
-                    "scenario": scenario_name,
+                    "commodity": mc_commodity,
                     "charge_delta": charge_delta,
                     "incentive_pct": incentive_pct
                 })
                 if mc_result and "samples" in mc_result:
-                    st.markdown("**Revenue Distribution (₹ Cr)**")
+                    st.caption(mc_result.get("based_on", ""))
                     fig_mc = go.Figure()
                     fig_mc.add_trace(go.Histogram(
                         x=mc_result["samples"], nbinsx=30,
-                        marker_color=GOLD, opacity=0.8, name="Revenue Distribution"
+                        marker_color=GOLD, opacity=0.8, name="Volume Distribution"
                     ))
                     fig_mc.add_vline(x=mc_result["p50"], line_dash="dash", line_color="#DC2626",
-                                     annotation_text=f"P50: ₹{mc_result['p50']} Cr")
+                                     annotation_text=f"P50: {mc_result['p50']:,.0f} t")
                     fig_mc.add_vline(x=mc_result["mean"], line_dash="dot", line_color="#059669",
-                                     annotation_text=f"Mean: ₹{mc_result['mean']} Cr")
+                                     annotation_text=f"Mean: {mc_result['mean']:,.0f} t")
                     fig_mc.update_layout(**PLOTLY_THEME, height=260,
-                                         title="Monte Carlo Revenue Distribution",
-                                         xaxis_title="Revenue (₹ Cr)", yaxis_title="Frequency")
+                                         title=f"Monte Carlo Volume Distribution — {mc_commodity}",
+                                         xaxis_title="Cargo Volume (Tonnes)", yaxis_title="Frequency")
                     st.plotly_chart(fig_mc, use_container_width=True)
 
                     c1, c2, c3 = st.columns(3)
-                    c1.metric("P10 (Conservative)", f"₹{mc_result['p10']} Cr")
-                    c2.metric("P50 (Median)", f"₹{mc_result['p50']} Cr")
-                    c3.metric("P90 (Optimistic)", f"₹{mc_result['p90']} Cr")
+                    c1.metric("P10 (Conservative)", f"{mc_result['p10']:,.0f} t")
+                    c2.metric("P50 (Median)", f"{mc_result['p50']:,.0f} t")
+                    c3.metric("P90 (Optimistic)", f"{mc_result['p90']:,.0f} t")
+                elif mc_result and "error" in mc_result:
+                    st.warning(mc_result["error"])
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
