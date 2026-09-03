@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query, Body
 from typing import Optional
 from backend.app.services import forecasting as fservice
-from backend.app.services import synthetic_data as sd
+from backend.app.services import routing as rservice
 
 router = APIRouter()
 
@@ -64,6 +64,6 @@ def run_scenario(payload: dict = Body(...)):
         horizon_months=horizon
     )
 
-@router.get("/berths", summary="Berth occupancy status")
+@router.get("/berths", summary="Real NMPA berth status — capacity & latest-month commodity utilization from data/berths.csv")
 def get_berths():
-    return {"berths": sd.generate_berth_status(12)}
+    return {"berths": rservice.get_live_berth_status()}

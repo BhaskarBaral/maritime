@@ -537,6 +537,8 @@ with tabs[1]:
       <div class="sec-sub">NMPA AIS tracking, ETA predictions, berth queueing, delay probability & route risk scoring</div>
     </div>""", unsafe_allow_html=True)
 
+    st.caption("⚠ The fleet tracker, per-ship ETAs, and risk scores below are illustrative demo data — no real AIS/vessel-tracking feed exists in this project. For a real, backtested prediction, see the **Vessel Call Forecast (ML)** panel further down this tab.")
+
     v_data = api_get("/vessels/") or {"vessels": []}
     alerts_data = api_get("/vessels/congestion-alerts") or {"alerts": []}
     vessels = v_data.get("vessels", [])
@@ -612,6 +614,50 @@ with tabs[1]:
             fig_risk.add_vline(x=0.35, line_dash="dash", line_color="#D97706", annotation_text="High Delay")
             fig_risk.update_layout(**PLOTLY_THEME, height=300)
             st.plotly_chart(fig_risk, use_container_width=True)
+
+    # ── Vessel Call Forecast (real ML, replaces the synthetic ETA above) ──
+    st.markdown("---")
+    st.markdown('<div class="panel"><div class="panel-title">Vessel Call Forecast (ML) — real, backtested</div>', unsafe_allow_html=True)
+    st.caption("Not a per-ship ETA — no AIS data exists for that. This predicts how many vessels are expected to call per month for a commodity, from real historical patterns in data/port_cargo_monthly.csv.")
+
+    vc_meta = api_get("/cargo/commodities") or {}
+    vc_status = vc_meta.get("commodity_status", {})
+    vc_current = sorted(c for c in vc_meta.get("commodities", []) if c != "ALL" and vc_status.get(c, {}).get("is_current", False))
+    vc_col1, vc_col2 = st.columns([2, 1])
+    with vc_col1:
+        vc_commodity = st.selectbox("Commodity", ["ALL"] + vc_current, index=0, key="vessel_forecast_commodity")
+    with vc_col2:
+        vc_horizon = st.selectbox("Horizon", [3, 6], format_func=lambda x: f"{x} Months", index=0, key="vessel_forecast_horizon")
+
+    vc_data = api_get("/vessels/forecast", {"horizon": vc_horizon, "commodity": vc_commodity, "section": "ALL"}) or {}
+    if vc_data and "summary" in vc_data:
+        vs = vc_data["summary"]
+        acc_reliable = vs.get("accuracy_reliable", True)
+        acc_display = "N/A" if vs.get("model_accuracy_pct") is None else f"{vs['model_accuracy_pct']:.1f}%"
+
+        vm1, vm2, vm3, vm4 = st.columns(4)
+        vm1.metric("Current Monthly Calls", f"{vs['current_monthly_vessel_calls']:.0f}")
+        vm2.metric("Expected Monthly Calls", f"{vs['expected_monthly_vessel_calls']:.0f}")
+        vm3.metric("Backtested Accuracy", acc_display, None if acc_reliable else "unvalidated")
+        vm4.metric("Avg. Days Between Calls", f"{vs['expected_days_between_calls']:.1f}d" if vs.get("expected_days_between_calls") else "—")
+
+        if not acc_reliable:
+            eval_note = vc_data.get("evaluation", {}).get("reliability_note")
+            st.warning(f"⚠ {eval_note or 'Accuracy not reliably measurable for this commodity — too little consistent history.'}")
+
+        series = vc_data.get("forecast_series", [])
+        if series:
+            fig_vc = go.Figure(go.Bar(
+                x=[s["month"] for s in series], y=[s["expected_vessel_calls"] for s in series],
+                marker_color=GOLD, text=[f"{s['expected_vessel_calls']:.0f}" for s in series], textposition="outside",
+            ))
+            fig_vc.update_layout(**PLOTLY_THEME, height=240, title=f"Expected Vessel Calls — {vc_commodity}",
+                                  xaxis_title="Month", yaxis_title="Vessel Calls")
+            fig_vc.update_xaxes(type="category")
+            st.plotly_chart(fig_vc, use_container_width=True)
+    elif vc_data and "error" in vc_data:
+        st.info(f"📭 {vc_data['error']}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
 

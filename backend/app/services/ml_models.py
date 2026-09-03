@@ -643,3 +643,179 @@ def run_incentive_monte_carlo(commodity: str, charge_delta_pct: float = -5.0,
             "response data exists in the dataset to train one against."
         ),
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. VESSEL CALL-COUNT FORECASTING — RandomForestRegressor
+# ═══════════════════════════════════════════════════════════════════
+# NOT a per-ship ETA. There is no AIS feed, no vessel-level timestamp, and no
+# real-time position data anywhere in this project — only monthly vessel
+# COUNTS per commodity/section (data/port_cargo_monthly.csv). What's real and
+# buildable from that is "how many vessels will call for this commodity next
+# month" — the same forecasting architecture as cargo tonnage, retargeted at
+# vessels_current. A literal "MV Example arrives Tuesday 3pm" prediction would
+# need a real AIS/tracking data source this project does not have.
+
+VESSEL_FEATURE_COLS = ["t_idx", "sin_m", "cos_m", "lag1", "lag3", "lag12", "roll3", "volume_scaled"]
+
+
+def _build_vessel_forecast_features(ts: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    t = ts.reset_index(drop=True).copy()
+    t["t_idx"] = np.arange(len(t))
+    month = t["date"].dt.month
+    t["sin_m"] = np.sin(2 * np.pi * month / 12)
+    t["cos_m"] = np.cos(2 * np.pi * month / 12)
+    t["lag1"] = t["vessels_current"].shift(1)
+    t["lag3"] = t["vessels_current"].shift(3)
+    t["lag12"] = t["vessels_current"].shift(12)
+    t["roll3"] = t["vessels_current"].shift(1).rolling(3).mean()
+    t[["lag1", "lag3", "lag12", "roll3"]] = t[["lag1", "lag3", "lag12", "roll3"]].bfill().fillna(0.0)
+    volume_mean = float(t["volume"].mean()) or 1.0
+    t["volume_scaled"] = t["volume"] / volume_mean
+    return t, volume_mean
+
+
+def _fit_vessel_forecast_model(train_ts: pd.DataFrame):
+    feat, volume_mean = _build_vessel_forecast_features(train_ts)
+    X = feat[VESSEL_FEATURE_COLS].values
+    y = feat["vessels_current"].values
+    model = RandomForestRegressor(
+        n_estimators=300, max_depth=4, min_samples_leaf=2, random_state=RANDOM_STATE
+    )
+    model.fit(X, y)
+    feat_state = {"volume_mean": volume_mean, "n_train": len(train_ts)}
+    return model, X, feat_state
+
+
+def _recursive_vessel_forecast(model, train_ts: pd.DataFrame, feat_state: dict, horizon_months: int) -> np.ndarray:
+    volume_mean = feat_state["volume_mean"]
+    n_train = feat_state["n_train"]
+    vessel_hist = train_ts["vessels_current"].tolist()
+    volume_scaled_hist = (train_ts["volume"] / volume_mean).tolist()
+    recent_volume_scaled = (
+        float(np.mean(volume_scaled_hist[-6:])) if len(volume_scaled_hist) >= 6
+        else (volume_scaled_hist[-1] if volume_scaled_hist else 1.0)
+    )
+
+    last_date = train_ts["date"].iloc[-1]
+    future_dates = [last_date + pd.DateOffset(months=i + 1) for i in range(horizon_months)]
+
+    hist = vessel_hist.copy()
+    preds = []
+    for i, d in enumerate(future_dates):
+        idx = n_train + i
+        month = d.month
+        sin_m, cos_m = np.sin(2 * np.pi * month / 12), np.cos(2 * np.pi * month / 12)
+        lag1 = hist[-1]
+        lag3 = hist[-3] if len(hist) >= 3 else hist[0]
+        lag12 = hist[-12] if len(hist) >= 12 else hist[0]
+        roll3 = float(np.mean(hist[-3:])) if len(hist) >= 3 else float(np.mean(hist))
+        row = [[idx, sin_m, cos_m, lag1, lag3, lag12, roll3, recent_volume_scaled]]
+        pred = max(0.0, float(model.predict(row)[0]))
+        preds.append(pred)
+        hist.append(pred)
+
+    return np.array(preds)
+
+
+def _evaluate_vessel_forecast(ts: pd.DataFrame) -> dict:
+    if len(ts) < 12:
+        return {"error": "Insufficient historical periods for evaluation"}
+    test_size = min(8, max(4, len(ts) // 4))
+    train_ts = ts.iloc[:-test_size].copy()
+    test_ts = ts.iloc[-test_size:].copy()
+    actual = test_ts["vessels_current"].values
+
+    model, _, feat_state = _fit_vessel_forecast_model(train_ts)
+    pred = _recursive_vessel_forecast(model, train_ts, feat_state, test_size)
+
+    mae = float(np.mean(np.abs(actual - pred)))
+    sum_true = float(np.sum(actual))
+    wape = float(np.sum(np.abs(actual - pred)) / sum_true * 100) if sum_true > 0 else None
+
+    nonzero_frac = float(np.mean(actual > 0))
+    reliable = nonzero_frac >= 0.4 and sum_true > 0
+    reliability_note = (
+        None if reliable else
+        f"Vessel calls are too intermittent/near-zero in the test window ({nonzero_frac * 100:.0f}% "
+        "of months nonzero) for accuracy to be a meaningful signal here — same limitation as the "
+        "cargo tonnage forecast for this commodity."
+    )
+
+    return {
+        "test_dates": [d.strftime("%Y-%m") for d in test_ts["date"]],
+        "actual_vessels": [round(float(v), 1) for v in actual],
+        "predicted_vessels": [round(float(v), 1) for v in pred],
+        "mae_vessels": round(mae, 1),
+        "wape_pct": round(min(wape, 100.0), 1) if wape is not None else None,
+        "accuracy_pct": round(max(0.0, 100.0 - wape), 1) if (wape is not None and reliable) else None,
+        "reliable_for_accuracy_scoring": reliable,
+        "reliability_note": reliability_note,
+    }
+
+
+def forecast_vessel_calls(horizon_months: int = 3, commodity: str = "ALL", section: str = "ALL") -> dict:
+    """Real RandomForestRegressor forecast of monthly vessel call counts (not per-ship ETA)."""
+    result = dict(_forecast_vessel_calls_cached(horizon_months, commodity, section))
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
+@_ttl_cache(seconds=300)
+def _forecast_vessel_calls_cached(horizon_months: int = 3, commodity: str = "ALL", section: str = "ALL") -> dict:
+    df = load_cargo_dataset()
+    ts = _aggregate_series(df, commodity=commodity, section=section)
+    if len(ts) == 0:
+        return {"error": f"No vessel records found for commodity '{commodity}' and section '{section}'"}
+
+    evaluation = _evaluate_vessel_forecast(ts)
+
+    if len(ts) < 8:
+        recent = float(ts["vessels_current"].iloc[-3:].mean()) if len(ts) >= 3 else float(ts["vessels_current"].mean())
+        forecast_vals = np.full(horizon_months, recent)
+    else:
+        model, _, feat_state = _fit_vessel_forecast_model(ts)
+        forecast_vals = _recursive_vessel_forecast(model, ts, feat_state, horizon_months)
+
+    last_date = ts["date"].iloc[-1]
+    dataset_max_date = df["date"].max()
+    months_stale = (dataset_max_date.year - last_date.year) * 12 + (dataset_max_date.month - last_date.month)
+    forecast_dates = [(last_date + pd.DateOffset(months=i + 1)).strftime("%Y-%m") for i in range(horizon_months)]
+
+    recent_actual = float(ts["vessels_current"].iloc[-1])
+    avg_expected_calls_per_month = float(np.mean(forecast_vals))
+    # Rough, explicitly-labeled proxy: if N vessels are expected this month,
+    # the average gap between calls is ~30/N days. This is NOT a per-vessel
+    # ETA — it says nothing about which ship or which day.
+    expected_days_between_calls = round(30.0 / avg_expected_calls_per_month, 1) if avg_expected_calls_per_month > 0 else None
+
+    facility_info = NMPA_FACILITY_MAP.get(commodity.upper(), NMPA_FACILITY_MAP["ALL"])
+
+    return {
+        "engine": "NMPA_VesselCallForecast_RandomForest_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "query_filter": {"commodity": commodity, "section": section, "horizon_months": horizon_months},
+        "nmpa_facility": facility_info,
+        "not_a_per_vessel_eta": (
+            "This forecasts how many vessels are expected to call per month for this commodity — "
+            "it is not a per-ship arrival-time prediction. No AIS/vessel-tracking data exists in "
+            "this project to support that; only monthly aggregate vessel counts do."
+        ),
+        "data_currency": {
+            "last_record_month": last_date.strftime("%Y-%m"),
+            "dataset_latest_month": dataset_max_date.strftime("%Y-%m"),
+            "is_stale": months_stale > 3,
+        },
+        "summary": {
+            "current_monthly_vessel_calls": round(recent_actual, 1),
+            "expected_monthly_vessel_calls": round(avg_expected_calls_per_month, 1),
+            "expected_days_between_calls": expected_days_between_calls,
+            "model_accuracy_pct": evaluation.get("accuracy_pct"),
+            "accuracy_reliable": evaluation.get("reliable_for_accuracy_scoring", False),
+        },
+        "forecast_series": [
+            {"month": forecast_dates[i], "expected_vessel_calls": round(float(forecast_vals[i]), 1)}
+            for i in range(horizon_months)
+        ],
+        "evaluation": evaluation,
+    }

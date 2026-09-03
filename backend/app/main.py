@@ -1,11 +1,14 @@
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend.app.routes import health, vessels, cargo, forecast, trade, anomaly, incentive, twin, copilot, pipeline, executive
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from backend.app.routes import health, vessels, cargo, forecast, trade, anomaly, incentive, twin, copilot, pipeline, executive, routing
 
 app = FastAPI(
     title="YellowSense Maritime Intelligence API",
     description="AI-Powered Maritime Port Intelligence Platform — Cargo Projection & Predictability Core Engine",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 app.add_middleware(
@@ -27,7 +30,25 @@ app.include_router(twin.router,      prefix="/twin",      tags=["Digital Twin"])
 app.include_router(copilot.router,   prefix="/copilot",   tags=["AI Copilot"])
 app.include_router(pipeline.router,  prefix="/pipeline",  tags=["Data Pipeline"])
 app.include_router(executive.router, prefix="/executive", tags=["Executive Dashboard"])
+app.include_router(routing.router,                         tags=["Cargo Routing & Facility Intelligence"])
+
+# Static JS/HTML dashboard (frontend/index.html, app.js, styles.css) — served
+# alongside the API. Streamlit (frontend/app.py) remains the separate primary
+# dashboard on port 8501; this exposes a lightweight web UI directly off the
+# FastAPI backend on port 8000. Mounted last so it never shadows the API routes above.
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+FRONTEND_DIR = BASE_DIR / "frontend"
+ASSETS_DIR = BASE_DIR / "assets"
+
+if ASSETS_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
+
+if FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 @app.get("/")
 def root():
-    return {"message": "YellowSense Maritime Intelligence API v3.0 — Data Grounded ML Engine Running", "modules": 8}
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(str(index_path))
+    return {"message": "YellowSense Maritime Intelligence API v3.1 — Data Grounded ML Engine Running", "modules": 9}

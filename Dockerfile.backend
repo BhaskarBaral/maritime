@@ -14,6 +14,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend codebase
 COPY backend/ ./backend/
 
+# Copy datasets (ml_models.py, forecasting.py and routing.py train/read from these at runtime)
+COPY data/ ./data/
+
+# Copy static web dashboard + shared assets (mounted by backend/app/main.py at "/" and "/assets")
+COPY frontend/index.html frontend/app.js frontend/styles.css ./frontend/
+COPY assets/ ./assets/
+
 # Create uploads directory
 RUN mkdir -p uploads
 
