@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query
 from backend.app.services import synthetic_data as sd
+from backend.app.services import routing as rservice
 
 router = APIRouter()
 
@@ -16,6 +17,6 @@ def get_scenario(scenario_key: str):
     return {"scenario_key": scenario_key, "result": result,
             "monte_carlo": sd.get_twin_monte_carlo(scenario_key)}
 
-@router.get("/berths")
+@router.get("/berths", summary="Real NMPA berth baseline (stress-test deltas applied client-side are simulated, the baseline is not)")
 def get_berth_map():
-    return {"berths": sd.generate_berth_status(12)}
+    return {"berths": rservice.get_live_berth_status()}

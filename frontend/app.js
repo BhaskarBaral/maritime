@@ -84,7 +84,7 @@ function renderTabContent(tabId) {
 // ─── TAB 1: Executive Dashboard Renderer ──────────────────────────────────────
 async function renderExecutive() {
   const container = document.getElementById('tab-executive');
-  container.innerHTML = `<div class="sec-header"><span class="sec-title">Executive Command Center</span><span class="sec-tag">Real-Time</span><div class="sec-sub">Port-wide operational intelligence — live KPIs, vessel positions, berth utilization & revenue</div></div><div class="grid-4" id="exec-kpis">Loading Executive KPIs...</div><br><div class="grid-3-2"><div class="card"><div style="font-family:Outfit;font-size:16px;font-weight:700;margin-bottom:12px;">NMPA Live AIS Vessel Approach Map</div><div id="exec-map" style="height:340px;"></div></div><div class="card"><div style="font-family:Outfit;font-size:16px;font-weight:700;margin-bottom:12px;">30-Day Revenue & Throughput Trend</div><div id="exec-trend" style="height:340px;"></div></div></div>`;
+  container.innerHTML = `<div class="sec-header"><span class="sec-title">Executive Command Center</span><span class="sec-tag">Demo Data</span><div class="sec-sub">Port-wide operational overview — KPIs, vessel positions, berth utilization & revenue</div></div><div class="alert-box alert-warning" style="margin-bottom:12px;">⚠ Revenue (₹ Cr), KPI deltas, and vessel positions/map on this tab are simulated — no financial/pricing or AIS dataset exists in this project. Only the underlying berth-utilization figures are real (data/berths.csv + latest cargo tonnage).</div><div class="grid-4" id="exec-kpis">Loading Executive KPIs...</div><br><div class="grid-3-2"><div class="card"><div style="font-family:Outfit;font-size:16px;font-weight:700;margin-bottom:12px;">NMPA Illustrative Vessel Approach Map</div><div id="exec-map" style="height:340px;"></div></div><div class="card"><div style="font-family:Outfit;font-size:16px;font-weight:700;margin-bottom:12px;">30-Day Revenue & Throughput Trend (Simulated)</div><div id="exec-trend" style="height:340px;"></div></div></div>`;
 
   const kpis = await fetchAPI('/executive/kpis') || {
     berth_utilization_pct: 72.4, berth_delta: "+2.1%",
@@ -233,7 +233,7 @@ async function updateCargoForecast() {
       <div style="display:flex;gap:16px;flex-wrap:wrap;">
         <div><div style="font-size:11px;color:#78716C;">Current Monthly</div><div style="font-size:18px;font-weight:800;">${(summ.current_monthly_volume_tonnes || 0).toLocaleString()} T</div></div>
         <div><div style="font-size:11px;color:#78716C;">Expected Avg</div><div style="font-size:18px;font-weight:800;color:#F59E0B;">${(summ.expected_monthly_avg_tonnes || 0).toLocaleString()} T</div></div>
-        <div><div style="font-size:11px;color:#78716C;">Forecast Growth</div><div style="font-size:18px;font-weight:800;color:#059669;">+${summ.forecast_change_pct || 13.6}%</div></div>
+        <div><div style="font-size:11px;color:#78716C;">Forecast Growth</div><div style="font-size:18px;font-weight:800;color:${summ.forecast_change_pct == null ? '#78716C' : (summ.forecast_change_pct >= 0 ? '#059669' : '#DC2626')};">${summ.forecast_change_pct == null ? 'N/A (resuming from zero)' : (summ.forecast_change_pct >= 0 ? '+' : '') + summ.forecast_change_pct + '%'}</div></div>
         <div><div style="font-size:11px;color:#78716C;">Model Accuracy</div><div style="font-size:18px;font-weight:800;color:#2563EB;">${summ.model_accuracy_pct || 82.8}%</div></div>
       </div>
     </div>
@@ -263,48 +263,66 @@ async function updateCargoForecast() {
   // Render Drivers
   const driversData = await fetchAPI(`/cargo/explainability?commodity=${encodeURIComponent(comm)}&section=${sec}`) || { drivers: [] };
   const drivers = driversData.drivers || [
-    { driver: 'Hinterland Industrial Demand (UPCL)', weight_pct: 45, impact_direction: 'Positive Growth' },
-    { driver: 'Monsoon Vessel Swell Delay', weight_pct: 25, impact_direction: 'Seasonal Impact' }
+    { factor: 'Hinterland Industrial Demand (UPCL)', weight_pct: 45, explanation: 'Positive Growth' },
+    { factor: 'Monsoon Vessel Swell Delay', weight_pct: 25, explanation: 'Seasonal Impact' }
   ];
   document.getElementById('fc-drivers').innerHTML = drivers.map(d => `
     <div style="background:#F9F5EC;border:1px solid #F3E8D6;border-radius:8px;padding:12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
-      <div><b>${d.driver}</b><div style="font-size:11px;color:#78716C;">${d.impact_direction}</div></div>
+      <div><b>${d.factor}</b><div style="font-size:11px;color:#78716C;">${d.explanation}</div></div>
       <div style="font-size:16px;font-weight:800;color:#92400E;">${d.weight_pct}% Weight</div>
     </div>
   `).join('');
 
   // Render Validation Backtesting
   const accData = await fetchAPI(`/cargo/accuracy?commodity=${encodeURIComponent(comm)}&section=${sec}`) || {};
-  const rWape = accData.ridge_wape || 4.94;
-  const accScore = accData.accuracy || 95.06;
-  const status = accData.validation_status || "PASSED";
-  const statusBg = status === "PASSED" ? "#DCFCE7" : "#FEF2F2";
-  const statusFg = status === "PASSED" ? "#166534" : "#991B1B";
-  const imp = accData.improvement || 4.12;
+  const baseline = accData.models?.[0];
+  const mlModel = accData.models?.[1];
 
+  if (!baseline || !mlModel) {
+    document.getElementById('fc-backtest').innerHTML = `<div class="alert-box alert-warning">${accData.error || 'Not enough historical periods to backtest this commodity/section.'}</div>`;
+    return;
+  }
+
+  const reliable = accData.data_reliability?.reliable_for_accuracy_scoring !== false;
+  const status = reliable ? "PASSED" : "LOW RELIABILITY";
+  const statusBg = reliable ? "#DCFCE7" : "#FEF2F2";
+  const statusFg = reliable ? "#166534" : "#991B1B";
+  const mlWape = mlModel.metrics.wape_pct;
+  const mlAcc = mlModel.metrics.accuracy_score_pct;
+  const baselineWape = baseline.metrics.wape_pct;
+  const improvement = mlModel.improvement_vs_baseline_wape_pct;
+
+  const testDates = accData.test_dates || [];
+  const actuals = accData.actual_test_volumes || [];
   let tableHtml = "";
-  if (accData.monthly_results && accData.monthly_results.length > 0) {
+  if (testDates.length > 0) {
     tableHtml = `
       <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:10px;">
         <thead>
           <tr style="background:#F3F4F6;text-align:left;">
             <th style="padding:6px;border:1px solid #E5E7EB;">Month</th>
             <th style="padding:6px;border:1px solid #E5E7EB;">Actual Cargo</th>
-            <th style="padding:6px;border:1px solid #E5E7EB;">Ridge Prediction</th>
+            <th style="padding:6px;border:1px solid #E5E7EB;">ML Prediction</th>
             <th style="padding:6px;border:1px solid #E5E7EB;">Seasonal Naive</th>
-            <th style="padding:6px;border:1px solid #E5E7EB;">Ridge Error %</th>
+            <th style="padding:6px;border:1px solid #E5E7EB;">ML Error %</th>
           </tr>
         </thead>
         <tbody>
-          ${accData.monthly_results.map(r => `
+          ${testDates.map((month, i) => {
+            const actual = actuals[i];
+            const mlPred = mlModel.predicted_volumes[i];
+            const basePred = baseline.predicted_volumes[i];
+            const errPct = actual ? Math.round(((mlPred - actual) / actual) * 1000) / 10 : 0;
+            return `
             <tr>
-              <td style="padding:6px;border:1px solid #E5E7EB;font-weight:600;">${r.month}</td>
-              <td style="padding:6px;border:1px solid #E5E7EB;">${r.actual_cargo.toLocaleString()} Tonnes</td>
-              <td style="padding:6px;border:1px solid #E5E7EB;">${r.ridge_prediction.toLocaleString()} Tonnes</td>
-              <td style="padding:6px;border:1px solid #E5E7EB;">${r.seasonal_naive.toLocaleString()} Tonnes</td>
-              <td style="padding:6px;border:1px solid #E5E7EB;color:${r.ridge_error_pct >= 0 ? '#15803D' : '#B91C1C'};font-weight:700;">${r.ridge_error_pct >= 0 ? '+' : ''}${r.ridge_error_pct}%</td>
+              <td style="padding:6px;border:1px solid #E5E7EB;font-weight:600;">${month}</td>
+              <td style="padding:6px;border:1px solid #E5E7EB;">${actual.toLocaleString()} Tonnes</td>
+              <td style="padding:6px;border:1px solid #E5E7EB;">${mlPred.toLocaleString()} Tonnes</td>
+              <td style="padding:6px;border:1px solid #E5E7EB;">${basePred.toLocaleString()} Tonnes</td>
+              <td style="padding:6px;border:1px solid #E5E7EB;color:${errPct >= 0 ? '#15803D' : '#B91C1C'};font-weight:700;">${errPct >= 0 ? '+' : ''}${errPct}%</td>
             </tr>
-          `).join('')}
+          `;
+          }).join('')}
         </tbody>
       </table>
     `;
@@ -313,19 +331,19 @@ async function updateCargoForecast() {
   document.getElementById('fc-backtest').innerHTML = `
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px;">
       <div style="background:#F9FAFB;padding:10px;border-radius:6px;border:1px solid #E5E7EB;">
-        <div style="font-size:10px;color:#6B7280;font-weight:700;">TRAINING PERIOD</div>
-        <div style="font-size:15px;font-weight:800;color:#1F2937;">${accData.training_period || "2023–2025"}</div>
-        <div style="font-size:10px;color:#9CA3AF;">${accData.training_observations || 36} months</div>
+        <div style="font-size:10px;color:#6B7280;font-weight:700;">EVALUATION WINDOW</div>
+        <div style="font-size:15px;font-weight:800;color:#1F2937;">${testDates[0] || '—'} to ${testDates[testDates.length - 1] || '—'}</div>
+        <div style="font-size:10px;color:#9CA3AF;">${accData.evaluation_period_months || testDates.length} held-out months</div>
       </div>
       <div style="background:#F9FAFB;padding:10px;border-radius:6px;border:1px solid #E5E7EB;">
-        <div style="font-size:10px;color:#6B7280;font-weight:700;">VALIDATION PERIOD</div>
-        <div style="font-size:15px;font-weight:800;color:#1F2937;">${accData.validation_period || "2026"}</div>
-        <div style="font-size:10px;color:#9CA3AF;">${accData.validation_observations || 6} months</div>
+        <div style="font-size:10px;color:#6B7280;font-weight:700;">MODEL</div>
+        <div style="font-size:13px;font-weight:800;color:#1F2937;">Random Forest</div>
+        <div style="font-size:10px;color:#9CA3AF;">${mlModel.status}</div>
       </div>
       <div style="background:#F9FAFB;padding:10px;border-radius:6px;border:1px solid #E5E7EB;">
-        <div style="font-size:10px;color:#6B7280;font-weight:700;">RIDGE WAPE</div>
-        <div style="font-size:15px;font-weight:800;color:#2563EB;">${rWape}%</div>
-        <div style="font-size:10px;color:#059669;font-weight:700;">Acc: ${accScore}% (100-WAPE)</div>
+        <div style="font-size:10px;color:#6B7280;font-weight:700;">ML WAPE</div>
+        <div style="font-size:15px;font-weight:800;color:#2563EB;">${mlWape}%</div>
+        <div style="font-size:10px;color:#059669;font-weight:700;">Acc: ${mlAcc}% (100-WAPE)</div>
       </div>
       <div style="background:${statusBg};padding:10px;border-radius:6px;border:1px solid ${statusFg}44;text-align:center;">
         <div style="font-size:10px;color:${statusFg};font-weight:700;">STATUS</div>
@@ -333,8 +351,8 @@ async function updateCargoForecast() {
       </div>
     </div>
     <div style="font-size:12px;color:#4B5563;margin-bottom:8px;">
-      <b>Seasonal Naive WAPE:</b> ${accData.baseline_wape || 9.06}% | <b>WAPE Improvement:</b> <span style="color:#059669;font-weight:700;">+${imp}% lower error</span><br>
-      <i>${accData.validation_note || "Validation performed on available 2026 observations."}</i>
+      <b>Seasonal Naive WAPE:</b> ${baselineWape}% | <b>WAPE Improvement:</b> <span style="color:${improvement >= 0 ? '#059669' : '#B91C1C'};font-weight:700;">${improvement >= 0 ? '+' : ''}${improvement}% ${improvement >= 0 ? 'lower error' : 'worse than baseline'}</span><br>
+      <i>${accData.data_reliability?.note || accData.recommended_metric_explanation || ""}</i>
     </div>
     ${tableHtml}
   `;
@@ -459,7 +477,7 @@ async function loadRoutingFacilities() {
 // ─── TAB 5: Trade Intelligence Renderer ──────────────────────────────────────
 async function renderTrade() {
   const container = document.getElementById('tab-trade');
-  container.innerHTML = `<div class="sec-header"><span class="sec-title">Commodity Demand by Trade Lane</span><span class="sec-tag">Module 3</span></div><div class="card" id="trade-content">Loading Trade Lanes...</div>`;
+  container.innerHTML = `<div class="sec-header"><span class="sec-title">Commodity Demand by Trade Lane</span><span class="sec-tag">Demo Data</span></div><div class="alert-box alert-warning" style="margin-bottom:12px;">⚠ This entire tab is simulated — no trade-lane, shipping-route, or commodity-price dataset exists in this project. For real commodity demand, see the Cargo Forecasting tab, grounded in data/port_cargo_monthly.csv.</div><div class="card" id="trade-content">Loading Trade Lanes...</div>`;
 
   const lanesData = await fetchAPI('/trade/lanes') || { lanes: [] };
   const lanes = lanesData.lanes || [];
@@ -478,27 +496,31 @@ async function renderTrade() {
 // ─── TAB 6: Anomaly Detection Renderer ────────────────────────────────────────
 async function renderAnomaly() {
   const container = document.getElementById('tab-anomaly');
-  container.innerHTML = `<div class="sec-header"><span class="sec-title">Cargo Anomaly & Risk Intelligence</span><span class="sec-tag">Module 4</span></div><div class="card" id="anomaly-list">Loading anomalies...</div>`;
+  container.innerHTML = `<div class="sec-header"><span class="sec-title">Cargo Anomaly & Risk Intelligence</span><span class="sec-tag">Real (ML)</span></div><div class="alert-box alert-warning" style="margin-bottom:12px;">⚠ Real IsolationForest model (scikit-learn) flagging genuine outlier months in data/port_cargo_monthly.csv — unsupervised, so there's no labeled ground truth to score accuracy against; severity is relative to other flagged months, not an absolute risk level.</div><div class="card" id="anomaly-list">Loading anomalies...</div>`;
 
-  const data = await fetchAPI('/anomaly/events') || { anomalies: [] };
-  const list = data.anomalies || [];
+  const data = await fetchAPI('/anomaly/events') || { events: [] };
+  const list = data.events || [];
   document.getElementById('anomaly-list').innerHTML = list.map(a => `
     <div class="alert-box alert-warning" style="margin-bottom:12px;">
-      <div><b>${a.type}</b> — ${a.message} (Severity: ${a.severity})</div>
+      <div><b>${a.type}</b> — ${a.commodity} (Severity: ${a.severity}, Confidence: ${(a.confidence * 100).toFixed(0)}%)</div>
+      <div style="font-size:12px;margin-top:4px;">${a.description}</div>
+      <div style="font-size:11px;color:#78716C;margin-top:4px;"><b>Recommended action:</b> ${a.recommended_action}</div>
     </div>
-  `).join('') || '<div class="alert-box alert-success">No active anomalies detected.</div>';
+  `).join('') || '<div class="alert-box alert-success">No anomalies detected in the current dataset.</div>';
 }
 
 // ─── TAB 7: Incentive Engine Renderer ─────────────────────────────────────────
 async function renderIncentive() {
   const container = document.getElementById('tab-incentive');
-  container.innerHTML = `<div class="sec-header"><span class="sec-title">Trade Incentive Engine</span><span class="sec-tag">Module 5</span></div><div class="card" id="incentive-recs">Loading recommendations...</div>`;
+  container.innerHTML = `<div class="sec-header"><span class="sec-title">Trade Incentive Engine</span><span class="sec-tag">Real (derived)</span></div><div class="alert-box alert-warning" style="margin-bottom:12px;">⚠ Recommendations are grounded in real YoY tonnage trends from data/port_cargo_monthly.csv. The incentive %/impact figures follow a documented elasticity formula (not a trained model — no historical incentive-campaign outcome data exists to fit one against), and revenue impact is "N/A" because the dataset has no tariff/pricing column.</div><div class="card" id="incentive-recs">Loading recommendations...</div>`;
 
   const data = await fetchAPI('/incentive/recommendations') || { recommendations: [] };
   const recs = data.recommendations || [];
   document.getElementById('incentive-recs').innerHTML = recs.map(r => `
     <div class="alert-box alert-success" style="margin-bottom:12px;">
-      <div><b>${r.policy_name}</b> — Target: ${r.target_commodity} | Projected Growth: +${r.projected_growth_pct}%</div>
+      <div><b>${r.action}</b> <span class="badge badge-normal">${r.priority}</span></div>
+      <div style="font-size:12px;margin-top:4px;">${r.rationale}</div>
+      <div style="font-size:11px;color:#78716C;margin-top:4px;">${r.current_metric} → Predicted traffic impact: ${r.predicted_traffic_impact} | Revenue impact: ${r.predicted_revenue_impact} | Confidence: ${(r.confidence * 100).toFixed(0)}%</div>
     </div>
   `).join('');
 }
@@ -506,7 +528,7 @@ async function renderIncentive() {
 // ─── TAB 8: Digital Twin Renderer ─────────────────────────────────────────────
 async function renderDigitalTwin() {
   const container = document.getElementById('tab-twin');
-  container.innerHTML = `<div class="sec-header"><span class="sec-title">Digital Twin Port Simulator</span><span class="sec-tag">Module 6</span></div><div class="card" id="twin-radar" style="height:360px;">Loading Digital Twin...</div>`;
+  container.innerHTML = `<div class="sec-header"><span class="sec-title">Digital Twin Port Simulator</span><span class="sec-tag">Demo Data</span></div><div class="alert-box alert-warning" style="margin-bottom:12px;">⚠ Scenario outcomes (congestion, storage, revenue) are simulated illustrations, not calibrated against real incident data.</div><div class="card" id="twin-radar" style="height:360px;">Loading Digital Twin...</div>`;
 
   const data = await fetchAPI('/twin/scenario/cargo_surge') || { result: {} };
   const r = data.result || {};
@@ -522,7 +544,8 @@ async function renderDigitalTwin() {
 async function renderCopilot() {
   const container = document.getElementById('tab-copilot');
   container.innerHTML = `
-    <div class="sec-header"><span class="sec-title">AI Maritime Copilot</span><span class="sec-tag">LangGraph 3-Tier</span></div>
+    <div class="sec-header"><span class="sec-title">AI Maritime Copilot</span><span class="sec-tag">Demo Data</span></div>
+    <div class="alert-box alert-warning" style="margin-bottom:12px;">⚠ "LangGraph" names the architecture pattern, not the library — langgraph/langchain are not dependencies of this project. Responses are templated, not generated by a real LLM call.</div>
     <div class="card" style="margin-bottom:20px;">
       <div class="form-group">
         <label class="form-label">Ask Maritime Copilot</label>
@@ -541,12 +564,13 @@ async function sendCopilotQuery() {
   const res = await fetchAPI('/copilot/query', {
     method: 'POST',
     body: JSON.stringify({ query })
-  }) || { answer: "Coal forecast is increasing due to higher thermal power demand from UPCL." };
+  }) || { response: { answer: "Coal forecast is increasing due to higher thermal power demand from UPCL." } };
+  const answer = res.response?.answer || "No response generated.";
 
   document.getElementById('copilot-output').innerHTML = `
     <div class="card">
       <div style="font-size:11px;font-weight:800;color:#D97706;">COPILOT SYNTHESIS RESPONSE</div>
-      <div style="font-size:15px;margin-top:8px;">${res.answer}</div>
+      <div style="font-size:15px;margin-top:8px;">${answer}</div>
     </div>
   `;
 }
@@ -555,15 +579,16 @@ async function sendCopilotQuery() {
 async function renderPipeline() {
   const container = document.getElementById('tab-pipeline');
   container.innerHTML = `
-    <div class="sec-header"><span class="sec-title">Data Pipeline & System Architecture</span><span class="sec-tag">Infrastructure</span></div>
+    <div class="sec-header"><span class="sec-title">Data Pipeline & System Architecture</span><span class="sec-tag">Demo Data</span></div>
+    <div class="alert-box alert-warning" style="margin-bottom:12px;">⚠ This entire tab is simulated — no Kafka/Spark/Airflow/Milvus/TimescaleDB infrastructure runs behind this project. The metrics and log lines below are a fixed hardcoded list illustrating the intended architecture, not live system telemetry.</div>
     <div class="grid-4" id="pipe-metrics">Loading pipeline...</div>
   `;
-  const data = await fetchAPI('/pipeline/status') || { kafka_msg_sec: 1450, spark_rows_sec: 12800, database_storage_gb: 420, airflow_active_dags: 14 };
+  const data = await fetchAPI('/pipeline/status') || { kafka: { messages_per_sec: 1450 }, spark: { rows_per_sec: 12800 }, data_pools: { total_storage_gb: 420 }, airflow: { dags_active: 14 } };
   document.getElementById('pipe-metrics').innerHTML = `
-    <div class="metric-card"><div class="metric-label">Kafka Msg/sec</div><div class="metric-value">${data.kafka_msg_sec}</div></div>
-    <div class="metric-card"><div class="metric-label">Spark Rows/sec</div><div class="metric-value">${data.spark_rows_sec}</div></div>
-    <div class="metric-card"><div class="metric-label">Storage GB</div><div class="metric-value">${data.database_storage_gb} GB</div></div>
-    <div class="metric-card"><div class="metric-label">Airflow Active DAGs</div><div class="metric-value">${data.airflow_active_dags}</div></div>
+    <div class="metric-card"><div class="metric-label">Kafka Msg/sec</div><div class="metric-value">${data.kafka?.messages_per_sec}</div></div>
+    <div class="metric-card"><div class="metric-label">Spark Rows/sec</div><div class="metric-value">${data.spark?.rows_per_sec}</div></div>
+    <div class="metric-card"><div class="metric-label">Storage GB</div><div class="metric-value">${data.data_pools?.total_storage_gb} GB</div></div>
+    <div class="metric-card"><div class="metric-label">Airflow Active DAGs</div><div class="metric-value">${data.airflow?.dags_active}</div></div>
   `;
 }
 
