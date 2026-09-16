@@ -19,6 +19,8 @@ __pycache__/
 # Runtime Data
 uploads/*.csv
 backend/app/services/audit_log.json
+data/sor_watch_manifest.json
+data/daily_vessel_position/*.pdf
 
 # Streamlit
 # Allow theme config to be committed, ignore other local session/telemetry files
@@ -31,3 +33,4 @@ backend/app/services/audit_log.json
 
 # Logs
 *.log
+logs/

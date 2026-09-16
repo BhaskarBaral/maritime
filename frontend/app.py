@@ -640,11 +640,72 @@ with tabs[1]:
         vm1.metric("Current Monthly Calls", f"{vs['current_monthly_vessel_calls']:.0f}")
         vm2.metric("Expected Monthly Calls", f"{vs['expected_monthly_vessel_calls']:.0f}")
         vm3.metric("Backtested Accuracy", acc_display, None if acc_reliable else "unvalidated")
-        vm4.metric("Avg. Days Between Calls", f"{vs['expected_days_between_calls']:.1f}d" if vs.get("expected_days_between_calls") else "—")
+        vm4.metric("Avg. Days Between Calls (ML proxy)", f"{vs['expected_days_between_calls']:.1f}d" if vs.get("expected_days_between_calls") else "—",
+                   help="Arithmetic proxy = 30 / expected monthly calls. Not a measured gap — see the real measured panel below for that.")
 
         if not acc_reliable:
             eval_note = vc_data.get("evaluation", {}).get("reliability_note")
             st.warning(f"⚠ {eval_note or 'Accuracy not reliably measurable for this commodity — too little consistent history.'}")
+
+        # ── Real measured spacing, from the Daily Vessel Position archive ──
+        # Deliberately kept visually separate from the ML metrics above:
+        # different source, different time span, can legitimately disagree.
+        rcs = vc_data.get("real_call_spacing", {})
+        st.markdown(
+            '<div style="margin-top:14px; padding:12px 16px; background:#FFF8ED; '
+            'border:1px solid #F0D9AE; border-left:4px solid #D97706; border-radius:10px;">'
+            '<div style="font-size:12.5px; font-weight:800; color:#92400E; letter-spacing:0.3px;">'
+            'REAL MEASURED — Daily Vessel Position archive (not the ML model above)</div>',
+            unsafe_allow_html=True,
+        )
+        if rcs.get("status") == "measured":
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("Avg. Days Between Calls (measured)", f"{rcs['avg_days_between_calls']:.2f}d")
+            rc2.metric("Implied Calls / Month (measured)", f"{rcs['implied_calls_per_month']:.1f}")
+            rc3.metric("Unique Calls Observed", f"{rcs['unique_call_count']}")
+            st.caption(
+                f"Berth(s) matched: {rcs['matched_berths']} · "
+                f"{rcs['date_range'][0]} to {rcs['date_range'][1]} · {rcs['caveat']}"
+            )
+        elif rcs.get("status") == "unavailable":
+            st.caption(f"Not available for this commodity: {rcs.get('reason', 'no reliable berth match.')}")
+        elif rcs.get("status") == "insufficient_data":
+            st.caption(f"Only {rcs.get('unique_call_count', 0)} berthing event(s) found for this commodity's berth(s) in the archive — too few to measure spacing.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # ── Real measured stay duration — a DIFFERENT source from the
+        # spacing box above: spacing measures gaps between calls, this
+        # measures how long each call occupied the berth. ──
+        rsd = vc_data.get("real_stay_duration", {})
+        st.markdown(
+            '<div style="margin-top:10px; padding:12px 16px; background:#FFF8ED; '
+            'border:1px solid #F0D9AE; border-left:4px solid #D97706; border-radius:10px;">'
+            '<div style="font-size:12.5px; font-weight:800; color:#92400E; letter-spacing:0.3px;">'
+            'REAL MEASURED — Berth occupancy / stay duration (linked from daily snapshots + movements log)</div>',
+            unsafe_allow_html=True,
+        )
+        if rsd.get("status") == "measured":
+            stats = rsd.get("exact_confidence_stats", {})
+            conf = rsd.get("confidence_breakdown", {})
+            if stats.get("count"):
+                rd1, rd2, rd3 = st.columns(3)
+                rd1.metric("Median Stay Duration", f"{stats['median_hours']:.1f}h",
+                           f"{stats['median_hours'] - 37:+.1f}h vs. NMPA's own 37h standard")
+                rd2.metric("Mean Stay Duration", f"{stats['mean_hours']:.1f}h")
+                rd3.metric("High-Confidence Calls", f"{stats['count']} of {rsd['total_calls_observed']}")
+                st.caption(
+                    f"Berth(s) matched: {rsd['matched_berths']} · confidence breakdown: {conf} · {rsd['caveat']}"
+                )
+            else:
+                st.caption(
+                    f"{rsd['total_calls_observed']} call(s) found for this commodity's berth(s), but none with "
+                    f"both ends pinned to a real timestamp yet (breakdown: {conf})."
+                )
+        elif rsd.get("status") == "unavailable":
+            st.caption(f"Not available for this commodity: {rsd.get('reason', 'no reliable berth match.')}")
+        elif rsd.get("status") == "insufficient_data":
+            st.caption("No linked stay-duration calls found for this commodity's berth(s) in the archive.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
         series = vc_data.get("forecast_series", [])
         if series:
@@ -951,6 +1012,244 @@ with tabs[2]:
                 f"{eval_data.get('error', 'insufficient historical periods (fewer than 12 months of data)')}. "
                 "The forecast above is unvalidated model extrapolation, not a measured-accuracy prediction."
             )
+
+        # ── NMPA Port Cost Estimator ──
+        st.markdown("---")
+        st.markdown(
+            '<div class="panel"><div class="panel-title">NMPA Port Cost Estimator</div>',
+            unsafe_allow_html=True
+        )
+
+        st.caption(
+            "Estimate known NMPA tariff components from cargo quantity, trade type, "
+            "cargo flow, vessel GRT, berth time and storage period. "
+            "This is a tariff-based estimate, not a complete invoice."
+        )
+
+        cost_col1, cost_col2, cost_col3 = st.columns(3)
+
+        with cost_col1:
+            cost_cargo_type = st.selectbox(
+                "Cargo Type",
+                [
+                    "Crude Oil",
+                    "POL Products",
+                    "LPG / LNG / Gas",
+                    "Edible Oil",
+                    "Fertilizer",
+                    "Coal",
+                    "Iron Ore",
+                    "Iron / Steel",
+                    "Limestone",
+                    "Cement / Construction Material",
+                    "Raw Cashew Nuts",
+                    "Cashew Kernels",
+                    "Food Grains",
+                    "Bentonite / Clay / Sand",
+                    "Break Bulk",
+                    "Plant & Machinery",
+                    "Other Cargo",
+                    "Container",
+                ],
+                key="cost_cargo_type",
+            )
+            cost_quantity = st.number_input(
+                "Cargo Quantity (MT)",
+                min_value=0.0,
+                value=10000.0,
+                step=100.0,
+                key="cost_quantity",
+            )
+            cost_trade = st.selectbox(
+                "Trade Type",
+                ["Coastal", "Foreign"],
+                key="cost_trade",
+            )
+
+        with cost_col2:
+            cost_flow = st.selectbox(
+                "Cargo Flow",
+                ["UNLOADED", "LOADED"],
+                format_func=lambda x: "Unloaded / Import" if x == "UNLOADED" else "Loaded / Export",
+                key="cost_flow",
+            )
+            cost_vessel_type = st.selectbox(
+                "Vessel Type",
+                [
+                    "Dry Bulk",
+                    "Liquid Tanker",
+                    "Container",
+                    "General Cargo",
+                    "RoRo / RoPax",
+                    "Other",
+                ],
+                key="cost_vessel_type",
+            )
+            cost_grt = st.number_input(
+                "Vessel GRT",
+                min_value=0.0,
+                value=30000.0,
+                step=1000.0,
+                key="cost_grt",
+                help="Gross Registered Tonnage used for berth-hire calculation.",
+            )
+
+        with cost_col3:
+            cost_berth_hours = st.number_input(
+                "Berth Occupancy / Hire Hours",
+                min_value=0.0,
+                value=24.0,
+                step=1.0,
+                key="cost_berth_hours",
+                help="Use actual berth hours when available. Later this can be replaced by a predicted vessel-stay value.",
+            )
+            cost_storage_days = st.number_input(
+                "Storage Days",
+                min_value=0,
+                value=0,
+                step=1,
+                key="cost_storage_days",
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        if st.button(
+            "Calculate NMPA Port Cost",
+            type="primary",
+            key="calculate_port_cost",
+        ):
+            cargo_type_map = {
+                "Crude Oil": "crude_spm",
+                "POL Products": "pol_products",
+                "LPG / LNG / Gas": "lpg_lng_gas",
+                "Edible Oil": "edible_oil",
+                "Fertilizer": "fertilizer",
+                "Coal": "thermal_coal",
+                "Iron Ore": "iron_ore_fines_lumps",
+                "Limestone": "limestone",
+                "Raw Cashew Nuts": "raw_cashew",
+                "Cashew Kernels": "cashew_kernels",
+                "Bentonite / Clay / Sand": "bentonite_clay",
+                "Plant & Machinery": "plant_machinery",
+                "Break Bulk": "bagged_cargo",
+                "Other Cargo": "bagged_cargo",
+            }
+
+            vessel_type_map = {
+                "Dry Bulk": "dry_bulk",
+                "Liquid Tanker": "liquid",
+                "Container": "container",
+                "General Cargo": "general_cargo",
+                "RoRo / RoPax": "roro",
+                "Other": "other",
+            }
+
+            flow_map = {
+                "UNLOADED": "import",
+                "LOADED": "export",
+                "COASTAL": "coastal",
+                "Unloaded / Import": "import",
+                "Loaded / Export": "export",
+                "Coastal": "coastal",
+            }
+
+            selected_trade_type = "foreign" if flow_map[cost_flow] in ("import", "export") else "coastal"
+
+            cost_payload = {
+                "cargo_type": cargo_type_map[cost_cargo_type],
+                "cargo_quantity_mt": cost_quantity,
+                "trade_type": selected_trade_type,
+                "cargo_flow": flow_map[cost_flow],
+                "vessel_type": vessel_type_map[cost_vessel_type],
+                "vessel_grt": cost_grt,
+                "berth_hours": cost_berth_hours,
+                "storage_days": cost_storage_days,
+            }
+
+            cost_result = api_post("/cost/calculate", cost_payload)
+
+            if cost_result and not cost_result.get("detail"):
+                breakdown = cost_result.get("breakdown", {})
+
+                wharfage = breakdown.get("wharfage", {})
+                berth_hire = breakdown.get("berth_hire", {})
+                storage = breakdown.get("transit_storage", {})
+                cst1, cst2, cst3, cst4 = st.columns(4)
+
+                cst1.metric(
+                    "Wharfage / Box Charge",
+                    f"₹{wharfage.get('amount', 0) or 0:,.2f}",
+                )
+
+                cst2.metric(
+                    "Berth Hire",
+                    f"₹{berth_hire.get('amount', 0) or 0:,.2f}",
+                )
+
+                cst3.metric(
+                    "Transit Storage",
+                    f"₹{storage.get('amount', 0) or 0:,.2f}",
+                )
+
+                cst4.metric(
+                    "Total Known Cost",
+                    f"₹{cost_result.get('total_known_cost', 0) or 0:,.2f}",
+                )
+
+                breakdown_rows = [
+                    {
+                        "Cost Component": "Wharfage / Container Box Charge",
+                        "Amount (₹)": wharfage.get("amount", 0) or 0,
+                    },
+                    {
+                        "Cost Component": "Berth Hire",
+                        "Amount (₹)": berth_hire.get("amount", 0) or 0,
+                    },
+                    {
+                        "Cost Component": "Transit Storage",
+                        "Amount (₹)": storage.get("amount", 0) or 0,
+                    },
+                ]
+
+                # Include any additional components returned by the backend.
+                for key, label in [
+                    ("reefer_electricity", "Reefer Electricity / Monitoring"),
+                    ("additional_charges", "Additional Known Charges"),
+                ]:
+                    if key in cost_result:
+                        breakdown_rows.append({
+                            "Cost Component": label,
+                            "Amount (₹)": cost_result.get(key, 0),
+                        })
+
+                st.dataframe(
+                    pd.DataFrame(breakdown_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                tariff_name = cost_result.get(
+                    "tariff_name",
+                    "NMPA Indexed Schedule of Rates",
+                )
+                effective_from = cost_result.get("effective_from", "01-05-2026")
+                effective_to = cost_result.get("effective_to", "30-04-2027")
+
+                st.caption(
+                    f"Tariff reference: **{tariff_name}** | "
+                    f"Effective: **{effective_from} to {effective_to}**"
+                )
+
+                st.info(
+                    "Known tariff components only. Final port billing may also depend on "
+                    "components not included in this estimator, such as pilotage, port dues, "
+                    "demurrage, labour/handling, crane charges, equipment charges, taxes, "
+                    "special cargo conditions, or other applicable SOR items."
+                )
+
+            elif cost_result and cost_result.get("detail"):
+                st.error(f"Cost calculation error: {cost_result['detail']}")
+
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Interactive What-If Cargo Scenario Simulator ──
         st.markdown("---")

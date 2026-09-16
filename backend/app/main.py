@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from backend.app.routes import health, vessels, cargo, forecast, trade, anomaly, incentive, twin, copilot, pipeline, executive, routing
+from backend.app.routes import cost
 
 app = FastAPI(
     title="YellowSense Maritime Intelligence API",
@@ -31,6 +32,7 @@ app.include_router(copilot.router,   prefix="/copilot",   tags=["AI Copilot"])
 app.include_router(pipeline.router,  prefix="/pipeline",  tags=["Data Pipeline"])
 app.include_router(executive.router, prefix="/executive", tags=["Executive Dashboard"])
 app.include_router(routing.router,                         tags=["Cargo Routing & Facility Intelligence"])
+app.include_router(cost.router,      prefix="/cost",      tags=["Cost"])
 
 # Static JS/HTML dashboard (frontend/index.html, app.js, styles.css) — served
 # alongside the API. Streamlit (frontend/app.py) remains the separate primary

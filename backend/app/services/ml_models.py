@@ -18,11 +18,15 @@ accuracy) so the reported number is measured against held-out data,
 not asserted.
 """
 
+import json
 import re
 import time
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import date, datetime, timezone
+from pathlib import Path
+from statistics import mean, median
 from typing import Any
 
 
@@ -57,6 +61,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 
 from backend.app.services.forecasting import load_cargo_dataset, NMPA_FACILITY_MAP
+from backend.app.services.vessel_entity_resolution import normalize_vessel_name
 
 RANDOM_STATE = 42
 
@@ -100,6 +105,253 @@ def _facility_berths(commodity: str) -> list[str]:
         else:
             expanded.append(p)
     return expanded
+
+
+# ═══════════════════════════════════════════════════════════════════
+# REAL MEASURED VESSEL-CALL SPACING — from the Daily Vessel Position
+# archive (data/daily_vessel_position_parsed/), NOT a model.
+#
+# This is a genuinely different thing from the ML forecast below and
+# must never be merged into the same numbers without labeling: the ML
+# forecast predicts a monthly *count* from 5 years of monthly
+# aggregates; this instead measures actual day-to-day spacing between
+# real berthing events over the ~1 year the daily archive covers, by
+# matching each vessel-call's berth number to the commodity's facility
+# berths (see vessel_position_parser.py for how the archive itself was
+# built and validated).
+# ═══════════════════════════════════════════════════════════════════
+
+DAILY_ARCHIVE_PARSED_DIR = Path(__file__).resolve().parents[3] / "data" / "daily_vessel_position_parsed"
+
+
+def _safe_commodity_berth_numbers(commodity: str) -> list[str] | None:
+    """
+    Returns the plain berth numbers (e.g. ["14"], ["15", "16"]) that can
+    be *reliably* matched against the Daily Vessel Position archive's
+    berth_no field for this commodity, or None if no reliable match
+    exists.
+
+    "ALL" returns [] (an explicit sentinel meaning "don't filter by
+    berth at all", not "no reliable berths").
+
+    Deliberately excludes Oil Jetty / SPM facilities (e.g. "OJ-1, OJ-2
+    & Offshore SPM" for TOTAL CRUDE): their labels contain digits
+    ("OJ-1") that would numeric-match a real, unrelated plain berth
+    ("Berth 1") in the daily archive. That's the exact bug class
+    already found and fixed once in routing.py's _berth_matches() —
+    Berth 1 (a shallow general-cargo berth) was silently absorbing
+    every commodity whose default berth label started with "1". Rather
+    than risk repeating it here, commodities whose only resolvable
+    berth tokens are OJ-/SPM-labeled are treated as unavailable.
+    """
+    if commodity.upper() == "ALL":
+        return []
+
+    numbers = []
+    for part in _facility_berths(commodity):
+        low = part.lower()
+        if "spm" in low or "oil jetty" in low or re.search(r"\boj[\s\-]?\d", low):
+            continue
+        m = re.search(r"\d+", part)
+        if m:
+            numbers.append(m.group())
+
+    return numbers or None
+
+
+def _load_real_berthing_events(berth_numbers: list[str] | None) -> list[date]:
+    """
+    Unique (vessel, calendar date) berthing events from the parsed
+    Daily Vessel Position archive, deduplicated so a vessel occupying
+    a berth across several consecutive daily reports counts once, not
+    once per day it was still there. Optionally filtered to
+    berth_numbers (exact numeric match against the archive's berth_no,
+    e.g. "14(W)" -> "14" -- same comparison approach as routing.py's
+    _berth_matches, not a substring check).
+    """
+    seen: set[tuple[str, date]] = set()
+
+    for path in sorted(DAILY_ARCHIVE_PARSED_DIR.glob("*.json")):
+        try:
+            day = json.loads(path.read_text())
+            report_date = date.fromisoformat(day["report_date"])
+        except (ValueError, KeyError, json.JSONDecodeError):
+            continue
+
+        for row in day.get("berthed", []):
+            vessel = (row.get("vessel_name") or "").strip()
+            berth_raw = (row.get("berth_no") or "").strip()
+            berthing_date_raw = (row.get("berthing_date") or "").strip()
+            if vessel in ("", "----") or "/" not in berthing_date_raw:
+                continue
+
+            if berth_numbers:  # non-empty list => filter; [] (ALL) => no filter
+                num_match = re.match(r"\d+", berth_raw)
+                if not num_match or num_match.group() not in berth_numbers:
+                    continue
+
+            try:
+                day_s, month_s = berthing_date_raw.split("/")
+                month_n, day_n = int(month_s), int(day_s)
+            except ValueError:
+                continue
+
+            year = report_date.year
+            if month_n - report_date.month > 6:
+                year -= 1
+            try:
+                full_date = date(year, month_n, day_n)
+            except ValueError:
+                continue
+
+            vessel_norm = normalize_vessel_name(vessel)
+            seen.add((vessel_norm, full_date))
+
+    return sorted({d for _, d in seen})
+
+
+def get_real_call_spacing(commodity: str) -> dict:
+    """
+    Real measured inter-arrival spacing for a commodity's berth(s),
+    from the Daily Vessel Position archive -- see the module-level
+    comment above for why this is a distinct source from the ML
+    forecast, not a replacement for it.
+    """
+    berth_numbers = _safe_commodity_berth_numbers(commodity)
+
+    if berth_numbers is None:
+        return {
+            "status": "unavailable",
+            "source": "data/daily_vessel_position_parsed (Daily Vessel Position archive)",
+            "reason": (
+                f"'{commodity}' is served by an Oil Jetty / SPM berth, which cannot be "
+                "reliably distinguished from other plain-numbered berths in the daily "
+                "archive without risking a false match -- skipped rather than guessed."
+            ),
+        }
+
+    if not DAILY_ARCHIVE_PARSED_DIR.exists():
+        return {"status": "unavailable", "reason": "Daily Vessel Position archive not parsed yet."}
+
+    events = _load_real_berthing_events(berth_numbers)
+    if len(events) < 2:
+        return {
+            "status": "insufficient_data",
+            "source": "data/daily_vessel_position_parsed (Daily Vessel Position archive)",
+            "matched_berths": berth_numbers or "ALL",
+            "unique_call_count": len(events),
+        }
+
+    gaps = [(events[i + 1] - events[i]).days for i in range(len(events) - 1)]
+    span_days = (events[-1] - events[0]).days or 1
+
+    return {
+        "status": "measured",
+        "source": "data/daily_vessel_position_parsed (NMPA Daily Vessel Position reports)",
+        "matched_berths": berth_numbers or "ALL",
+        "date_range": [events[0].isoformat(), events[-1].isoformat()],
+        "unique_call_count": len(events),
+        "avg_days_between_calls": round(mean(gaps), 2),
+        "median_days_between_calls": round(median(gaps), 1),
+        "implied_calls_per_month": round(len(events) / (span_days / 30.44), 2),
+        "caveat": (
+            "Uses normalize_vessel_name() (strips draft/LOA and berth-reference annotations, "
+            "e.g. '(B.14)' or 'B.10/11'), the same normalization behind the vessel entity "
+            "registry (data/vessel_registry.json). Note this figure is deduplicated by "
+            "(vessel, calendar date), so it doesn't actually depend much on name-matching "
+            "quality -- unmerged typo variants of the same ship still land on different real "
+            "calendar dates and get counted correctly either way. Known residual gap: "
+            "same-ship spellings that differ in their FIRST word (e.g. a stray prefix) aren't "
+            "flagged by the review-candidate list, which only compares names sharing a first "
+            "token -- see data/vessel_name_review_candidates.json."
+        ),
+    }
+
+
+VESSEL_STAYS_PATH = Path(__file__).resolve().parents[3] / "data" / "vessel_stays.json"
+
+
+@_ttl_cache(seconds=300)
+def _load_vessel_stays_cached() -> list[dict]:
+    if not VESSEL_STAYS_PATH.exists():
+        return []
+    return json.loads(VESSEL_STAYS_PATH.read_text())
+
+
+def get_real_stay_duration(commodity: str) -> dict:
+    """
+    Real measured berth-occupancy (stay) duration for a commodity's
+    berth(s), from data/vessel_stays.json -- see
+    vessel_stay_duration.py for how each call's start/end is linked
+    from the daily berthed-snapshot + movements-log event sources, and
+    why each stay carries its own confidence label rather than being
+    asserted uniformly precise.
+    """
+    berth_numbers = _safe_commodity_berth_numbers(commodity)
+
+    if berth_numbers is None:
+        return {
+            "status": "unavailable",
+            "source": "data/vessel_stays.json (linked Daily Vessel Position archive)",
+            "reason": (
+                f"'{commodity}' is served by an Oil Jetty / SPM berth, which cannot be "
+                "reliably distinguished from other plain-numbered berths in the daily "
+                "archive without risking a false match -- skipped rather than guessed."
+            ),
+        }
+
+    stays = _load_vessel_stays_cached()
+    if not stays:
+        return {"status": "unavailable", "reason": "Vessel stay-duration linkage has not been built yet."}
+
+    if berth_numbers:  # non-empty => filter; [] (ALL) => every stay
+        matched = []
+        for s in stays:
+            berth_raw = s.get("berth_no") or ""
+            m = re.match(r"\d+", berth_raw)
+            if m and m.group() in berth_numbers:
+                matched.append(s)
+    else:
+        matched = stays
+
+    if not matched:
+        return {
+            "status": "insufficient_data",
+            "source": "data/vessel_stays.json",
+            "matched_berths": berth_numbers or "ALL",
+            "call_count": 0,
+        }
+
+    by_confidence = Counter(s["confidence"] for s in matched)
+    exact = [s["duration_hours"] for s in matched if s["confidence"] == "exact" and s["duration_hours"] is not None]
+
+    result = {
+        "status": "measured",
+        "source": "data/vessel_stays.json (berthed-snapshot + movements-log, linked per call)",
+        "matched_berths": berth_numbers or "ALL",
+        "total_calls_observed": len(matched),
+        "confidence_breakdown": dict(by_confidence),
+        "nmpa_official_standard_hours": 37,
+        "caveat": (
+            "Only 'exact' confidence calls (both berthing and departure pinned to a real "
+            "movements-log timestamp) are used for the mean/median below. 'date_only' calls "
+            "(one end inferred from the daily snapshot's calendar date) and "
+            "'unconfirmed_lower_bound' calls (no departure event found -- vessel may still be "
+            "in port) are counted in confidence_breakdown but excluded from the average so a "
+            "handful of long, uncertain stays can't silently skew it."
+        ),
+    }
+
+    if exact:
+        result["exact_confidence_stats"] = {
+            "count": len(exact),
+            "mean_hours": round(mean(exact), 1),
+            "median_hours": round(median(exact), 1),
+        }
+    else:
+        result["exact_confidence_stats"] = {"count": 0, "mean_hours": None, "median_hours": None}
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -818,4 +1070,19 @@ def _forecast_vessel_calls_cached(horizon_months: int = 3, commodity: str = "ALL
             for i in range(horizon_months)
         ],
         "evaluation": evaluation,
+        # Deliberately a sibling of "summary", not merged into it: this
+        # is measured from real daily berthing events (see
+        # get_real_call_spacing's docstring), not the ML model above.
+        # The two can legitimately disagree -- e.g. they measure
+        # different populations (this commodity's specific berths vs.
+        # a monthly count that may include other sections/flows) and
+        # cover different time spans (~1 year of daily data vs. 5
+        # years of monthly data) -- so never average or reconcile them
+        # silently; show both, labeled.
+        "real_call_spacing": get_real_call_spacing(commodity),
+        # Same "sibling, never merged" rule as real_call_spacing above,
+        # and a distinct source from IT too: spacing measures gaps
+        # between calls, this measures how long each call occupied the
+        # berth -- see get_real_stay_duration's docstring.
+        "real_stay_duration": get_real_stay_duration(commodity),
     }
