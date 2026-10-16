@@ -34,3 +34,4 @@ data/daily_vessel_position/*.pdf
 # Logs
 *.log
 logs/
+~$*

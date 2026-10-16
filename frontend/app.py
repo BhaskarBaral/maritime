@@ -1013,241 +1013,258 @@ with tabs[2]:
                 "The forecast above is unvalidated model extrapolation, not a measured-accuracy prediction."
             )
 
-        # ── NMPA Port Cost Estimator ──
+        # ── NMPA Port Cost & Tariff Calculator ──
+        # Every number here comes from the NMPA SOR 2026-27, a real past
+        # vessel call in NMPA's Daily Vessel Position reports, or the user.
+        # Missing inputs (e.g. GRT) are reported as missing, never guessed.
         st.markdown("---")
         st.markdown(
-            '<div class="panel"><div class="panel-title">NMPA Port Cost Estimator</div>',
+            '<div class="panel"><div class="panel-title">NMPA Port Cost & Tariff Calculator</div>',
             unsafe_allow_html=True
         )
-
         st.caption(
-            "Estimate known NMPA tariff components from cargo quantity, trade type, "
-            "cargo flow, vessel GRT, berth time and storage period. "
-            "This is a tariff-based estimate, not a complete invoice."
+            "Rates: NMPA Indexed SOR w.e.f. 01-05-2026. Inputs: real vessel calls from NMPA's "
+            "Daily Vessel Position reports. Checked against SOR 2022 and NMPA's 2023-24 income (see below)."
         )
 
+        def _cost_post(payload):
+            try:
+                r = requests.post(f"{API}/cost/calculate", json=payload, timeout=15)
+                body = r.json()
+                if r.status_code != 200:
+                    d = body.get("detail")
+                    return None, (d.get("message") or d.get("error")) if isinstance(d, dict) else str(d)
+                return body, None
+            except Exception as exc:
+                return None, str(exc)
+
+        # ---- start from a real past call ----
+        pc_q = st.text_input(
+            "Find a real past call (vessel, cargo, berth or receiver)",
+            key="cost_pc_q", placeholder="e.g. IOF, LPG, KIOCL, SPM",
+        )
+        pc_list = api_get("/cost/past-calls", {"q": pc_q, "limit": 400}) or {}
+        pc_calls = pc_list.get("calls", [])
+        pc_labels = {
+            c["id"]: (
+                f"{c['berthing_date']} · {c['vessel']} · "
+                f"{'SPM' if c['berth'] == 'SPM' else 'B' + str(c['berth']) if c['berth'] else '—'} · "
+                f"{c['cargo_raw']} · {c['quantity']:,.0f} t"
+            )
+            for c in pc_calls
+        }
+        pc_id = st.selectbox(
+            "Past call (newest first)", list(pc_labels), format_func=pc_labels.get,
+            key="cost_pc_id", index=0 if pc_labels else None,
+        )
+        pc = api_get(f"/cost/past-calls/{pc_id}") if pc_id else None
+        pc_in = (pc or {}).get("calculator_inputs", {})
+        if pc:
+            c = pc["call"]
+            st.caption(
+                f"**{c['vessel']}** · berthed {c['berthing_date']} · Berth {c['berth'] or '—'} · run **{c['run_raw'] or '?'}** · "
+                f"LOA {c['loa_m'] or '—'} m · {c['receiver_shipper'] or '—'} — quantity **{(c['quantity'] or 0):,.0f}** "
+                f"({c['quantity_basis']}); berth hours **{c['berth_hours'] or 0:,.2f}** ({c['berth_hours_confidence']}). "
+                "GRT is not in NMPA's daily reports — enter it from the tonnage certificate."
+            )
+        sfx = f"_{pc_id}" if pc_id else ""
+
+        flows = ["import", "export", "coastal", "transhipment"]
+        vtypes = {
+            "dry_bulk": "Dry bulk", "liquid": "POL / liquid tanker", "hazardous": "Hazardous cargo / chemicals",
+            "container": "Container", "general_cargo": "General cargo / break bulk", "roro": "RoRo / RoPax",
+            "other": "Other cargo vessel", "bunkering_at_berth": "Calling only for bunkering at berth",
+            "barge_tug_craft": "Barge / tug / small craft", "bunker_barge": "Bunker barge",
+            "fishing_service_boat": "Fishing / service boat",
+        }
+        berths = [""] + [str(i) for i in range(1, 17)] + ["SPM"]
+        pc_berth = (pc_in.get("berth") or "").upper()
+        pc_berth = pc_berth if pc_berth in berths else "".join(ch for ch in pc_berth.split("(")[0] if ch.isdigit())
+
         cost_col1, cost_col2, cost_col3 = st.columns(3)
-
         with cost_col1:
-            cost_cargo_type = st.selectbox(
-                "Cargo Type",
-                [
-                    "Crude Oil",
-                    "POL Products",
-                    "LPG / LNG / Gas",
-                    "Edible Oil",
-                    "Fertilizer",
-                    "Coal",
-                    "Iron Ore",
-                    "Iron / Steel",
-                    "Limestone",
-                    "Cement / Construction Material",
-                    "Raw Cashew Nuts",
-                    "Cashew Kernels",
-                    "Food Grains",
-                    "Bentonite / Clay / Sand",
-                    "Break Bulk",
-                    "Plant & Machinery",
-                    "Other Cargo",
-                    "Container",
-                ],
-                key="cost_cargo_type",
-            )
-            cost_quantity = st.number_input(
-                "Cargo Quantity (MT)",
-                min_value=0.0,
-                value=10000.0,
-                step=100.0,
-                key="cost_quantity",
-            )
-            cost_trade = st.selectbox(
-                "Trade Type",
-                ["Coastal", "Foreign"],
-                key="cost_trade",
-            )
-
+            cost_cargo_type = st.text_input("Commodity (any name, NMPA code or SOR code)",
+                                            value=pc_in.get("cargo_type", ""), key="cost_cargo" + sfx)
+            cost_quantity = st.number_input("Quantity (MT, or CBM / units where the SOR says so)", min_value=0.0,
+                                            value=pc_in.get("cargo_quantity_mt"), step=100.0, key="cost_qty" + sfx)
+            cost_flow = st.selectbox("Cargo flow", flows, index=flows.index(pc_in.get("cargo_flow", "import")),
+                                     format_func={"import": "Unloaded / Import (foreign cargo)",
+                                                  "export": "Loaded / Export (foreign cargo)",
+                                                  "coastal": "Coastal cargo", "transhipment": "Transhipment"}.get,
+                                     key="cost_flow" + sfx)
+            cost_trade = st.selectbox("Cargo trade (transhipment only)", ["foreign", "coastal"], format_func=str.title,
+                                      key="cost_trade" + sfx, disabled=cost_flow != "transhipment")
+            cost_party = st.text_input("Receiver / shipper", value=pc_in.get("receiver_shipper") or "",
+                                       key="cost_party" + sfx, help="Needed for the KIOCL / UPCL rules.")
         with cost_col2:
-            cost_flow = st.selectbox(
-                "Cargo Flow",
-                ["UNLOADED", "LOADED"],
-                format_func=lambda x: "Unloaded / Import" if x == "UNLOADED" else "Loaded / Export",
-                key="cost_flow",
-            )
-            cost_vessel_type = st.selectbox(
-                "Vessel Type",
-                [
-                    "Dry Bulk",
-                    "Liquid Tanker",
-                    "Container",
-                    "General Cargo",
-                    "RoRo / RoPax",
-                    "Other",
-                ],
-                key="cost_vessel_type",
-            )
-            cost_grt = st.number_input(
-                "Vessel GRT",
-                min_value=0.0,
-                value=30000.0,
-                step=1000.0,
-                key="cost_grt",
-                help="Gross Registered Tonnage used for berth-hire calculation.",
-            )
-
+            cost_vrun = st.selectbox("Vessel status (Customs / DGS)", ["foreign", "coastal"],
+                                     index=0 if pc_in.get("vessel_trade_type", "foreign") == "foreign" else 1,
+                                     format_func={"foreign": "Foreign-going (US$ rates)", "coastal": "Coastal (₹ rates)"}.get,
+                                     key="cost_vrun" + sfx)
+            cost_vessel_type = st.selectbox("Vessel type (berth hire class)", list(vtypes),
+                                            index=list(vtypes).index(pc_in.get("vessel_type", "dry_bulk")),
+                                            format_func=vtypes.get, key="cost_vtype" + sfx)
+            cost_grt = st.number_input("Vessel GRT (from tonnage certificate)", min_value=0.0, value=None, step=1.0,
+                                       key="cost_grt" + sfx, placeholder="required for vessel charges")
+            cost_berth = st.selectbox("Berth", berths, index=berths.index(pc_berth) if pc_berth in berths else 0,
+                                      format_func=lambda b: "— not set —" if not b else ("SPM (MRPL)" if b == "SPM" else f"Berth {b}"),
+                                      key="cost_berth" + sfx)
+            cost_berth_hours = st.number_input("Berth hours (all fast → all lines cast off)", min_value=0.0,
+                                               value=pc_in.get("berth_hours"), step=1.0, key="cost_bh" + sfx)
+            cost_usd_inr = st.number_input("USD → INR (RBI reference, vessel entry day)", min_value=0.0, value=None,
+                                           step=0.01, format="%.4f", key="cost_usd" + sfx,
+                                           placeholder="needed for foreign vessels")
         with cost_col3:
-            cost_berth_hours = st.number_input(
-                "Berth Occupancy / Hire Hours",
-                min_value=0.0,
-                value=24.0,
-                step=1.0,
-                key="cost_berth_hours",
-                help="Use actual berth hours when available. Later this can be replaced by a predicted vessel-stay value.",
-            )
-            cost_storage_days = st.number_input(
-                "Storage Days",
-                min_value=0,
-                value=0,
-                step=1,
-                key="cost_storage_days",
-            )
-            st.markdown("<br>", unsafe_allow_html=True)
+            cost_storage_days = st.number_input("Days in transit storage", min_value=0, value=0, step=1, key="cost_sd" + sfx)
+            cost_holidays = st.number_input("Customs holidays / non-working days in free period", min_value=0, value=0,
+                                            step=1, key="cost_hol" + sfx)
+            cost_storage_category = st.selectbox("Storage category", ["bulk", "break_bulk", "salvaged", "not_shipped"],
+                                                 format_func={"bulk": "Bulk", "break_bulk": "Break bulk",
+                                                              "salvaged": "Salvaged goods (export)",
+                                                              "not_shipped": "Export cargo not shipped"}.get,
+                                                 key="cost_cat" + sfx)
+            cost_anch = st.number_input("Anchorage hours after sailing", min_value=0.0, value=0.0, step=1.0, key="cost_anch" + sfx)
+            cost_tug = st.number_input("Tug hours hired on request", min_value=0.0, value=0.0, step=1.0, key="cost_tug" + sfx)
+            cost_shifts = st.number_input("Shiftings at vessel's request", min_value=0, value=0, step=1, key="cost_shift" + sfx)
+            cost_annual_volume = st.number_input("Annual volume (MT) — cement band only", min_value=0.0, value=None,
+                                                 step=10000.0, key="cost_annual" + sfx)
 
-        if st.button(
-            "Calculate NMPA Port Cost",
-            type="primary",
-            key="calculate_port_cost",
-        ):
-            cargo_type_map = {
-                "Crude Oil": "crude_spm",
-                "POL Products": "pol_products",
-                "LPG / LNG / Gas": "lpg_lng_gas",
-                "Edible Oil": "edible_oil",
-                "Fertilizer": "fertilizer",
-                "Coal": "thermal_coal",
-                "Iron Ore": "iron_ore_fines_lumps",
-                "Limestone": "limestone",
-                "Raw Cashew Nuts": "raw_cashew",
-                "Cashew Kernels": "cashew_kernels",
-                "Bentonite / Clay / Sand": "bentonite_clay",
-                "Plant & Machinery": "plant_machinery",
-                "Break Bulk": "bagged_cargo",
-                "Other Cargo": "bagged_cargo",
-            }
+        if cost_cargo_type:
+            cost_match = api_get("/cost/match", {"name": cost_cargo_type})
+            if cost_match and cost_match.get("code"):
+                match_text = f"Matched to **{cost_match['code']}** — {cost_match['item']} ({cost_match['method']})"
+                if cost_match.get("needs_review"):
+                    st.warning(match_text + " — confirm the SOR line. " + (cost_match.get("ambiguity") or ""))
+                else:
+                    st.caption(match_text)
+            elif cost_match:
+                st.warning(cost_match.get("message", "This entry cannot be priced by wharfage."))
 
-            vessel_type_map = {
-                "Dry Bulk": "dry_bulk",
-                "Liquid Tanker": "liquid",
-                "Container": "container",
-                "General Cargo": "general_cargo",
-                "RoRo / RoPax": "roro",
-                "Other": "other",
-            }
-
-            flow_map = {
-                "UNLOADED": "import",
-                "LOADED": "export",
-                "COASTAL": "coastal",
-                "Unloaded / Import": "import",
-                "Loaded / Export": "export",
-                "Coastal": "coastal",
-            }
-
-            selected_trade_type = "foreign" if flow_map[cost_flow] in ("import", "export") else "coastal"
-
-            cost_payload = {
-                "cargo_type": cargo_type_map[cost_cargo_type],
-                "cargo_quantity_mt": cost_quantity,
-                "trade_type": selected_trade_type,
-                "cargo_flow": flow_map[cost_flow],
-                "vessel_type": vessel_type_map[cost_vessel_type],
-                "vessel_grt": cost_grt,
-                "berth_hours": cost_berth_hours,
+        if st.button("Calculate NMPA Port Cost", type="primary", key="calculate_port_cost"):
+            trade = "foreign" if cost_flow in ("import", "export") else "coastal" if cost_flow == "coastal" else cost_trade
+            cost_result, cost_err = _cost_post({
+                "cargo_type": cost_cargo_type,
+                "cargo_quantity_mt": cost_quantity or 0,
+                "trade_type": trade,
+                "vessel_trade_type": cost_vrun,
+                "cargo_flow": cost_flow,
+                "vessel_type": cost_vessel_type,
+                "vessel_grt": cost_grt or None,
+                "berth": cost_berth or None,
+                "berth_hours": cost_berth_hours or 0,
                 "storage_days": cost_storage_days,
-            }
+                "excluded_days_in_free_period": cost_holidays,
+                "cargo_category": cost_storage_category,
+                "annual_volume_mt": cost_annual_volume or None,
+                "usd_inr_rate": cost_usd_inr or None,
+                "receiver_shipper": cost_party or None,
+                "anchorage_hours": cost_anch,
+                "tug_hire_hours": cost_tug,
+                "shifting_count": cost_shifts,
+            })
 
-            cost_result = api_post("/cost/calculate", cost_payload)
-
-            if cost_result and not cost_result.get("detail"):
+            if cost_err:
+                st.error(f"Cost calculation error: {cost_err}")
+            elif cost_result:
                 breakdown = cost_result.get("breakdown", {})
+                vessel_keys = ("port_dues", "pilotage", "berth_hire", "anchorage", "tug_hire", "shifting")
+                m1, m2, m3, m4 = st.columns(4)
+                wh = breakdown.get("wharfage", {})
+                m1.metric("Wharfage", f"₹{wh['amount']:,.2f}" if wh.get("amount") is not None else "—")
+                m2.metric("Vessel related", f"₹{sum((breakdown[k].get('amount') or 0) for k in vessel_keys if breakdown.get(k, {}).get('status') == 'calculated'):,.2f}")
+                m3.metric("Total known cost", f"₹{cost_result['total_known_cost']:,.2f}",
+                          f"bill ₹{cost_result['bill_total_rounded']:,} + GST", delta_color="off")
+                m4.metric("Estimate", "Complete" if cost_result["is_complete"] else "Partial")
 
-                wharfage = breakdown.get("wharfage", {})
-                berth_hire = breakdown.get("berth_hire", {})
+                for ex in cost_result.get("exceptions", []):
+                    (st.warning if ex["scope"] == "note" else st.error)(ex["message"])
+                if cost_result.get("missing_grt_components"):
+                    st.warning("Not in the total: " + ", ".join(cost_result["missing_grt_components"]) + " — enter the vessel's GRT.")
+                if cost_result.get("unconverted_usd_components"):
+                    st.warning(f"US$ {cost_result['unconverted_usd_total']:,.2f} of foreign-vessel charges is not in the ₹ "
+                               "total. Enter the RBI USD→INR reference rate for the vessel's entry day.")
+                for note in cost_result.get("notes", []):
+                    st.info(note)
+
+                labels = {"wharfage": "Wharfage", "transit_storage": "Transit storage", "port_dues": "Port dues",
+                          "pilotage": "Pilotage", "berth_hire": "Berth hire", "anchorage": "Anchorage",
+                          "tug_hire": "Tug hire", "shifting": "Shifting", "bunkering_facility": "Bunkering facility"}
+                status_labels = {"calculated": "Calculated", "needs_exchange_rate": "Needs USD→INR rate",
+                                 "needs_grt": "Needs GRT", "not_billed_by_nmpa": "Not billed by NMPA",
+                                 "not_applicable": "Not applicable", "rate_unavailable": "Rate not published"}
+                st.dataframe(pd.DataFrame([
+                    {
+                        "Component": labels.get(k, k),
+                        "SOR Ref": comp.get("sor_reference"),
+                        "Status": status_labels.get(comp.get("status"), comp.get("status")),
+                        "Currency": comp.get("currency") or comp.get("reference_currency"),
+                        "Amount (US$)": comp.get("amount_usd"),
+                        "Amount (₹)": comp.get("amount"),
+                        "Reference only": comp.get("reference_amount"),
+                        "Detail": comp.get("message") or comp.get("note") or "",
+                    }
+                    for k, comp in breakdown.items()
+                ]), use_container_width=True, hide_index=True)
+
+                if wh.get("sor_code"):
+                    st.caption(f"Wharfage: SOR {wh['sor_code']} — {wh['sor_item']} | {wh['chargeable_units']:,.1f} "
+                               f"chargeable {wh['unit']} × ₹{wh['rate_per_mt']:,.2f} ({wh['trade_type']} cargo)")
                 storage = breakdown.get("transit_storage", {})
-                cst1, cst2, cst3, cst4 = st.columns(4)
+                rule = storage.get("free_days_rule", {})
+                if rule.get("status") == "configured":
+                    st.caption(f"Storage: free period **{rule['free_storage_days']}"
+                               f"{' + ' + str(rule['extended_by_non_working_days']) if rule.get('extended_by_non_working_days') else ''} days** — "
+                               f"{rule['basis']} (SOR {rule['sor_reference']}); chargeable days **{storage.get('chargeable_days', 0):g}**.")
+                if storage.get("slabs"):
+                    st.dataframe(pd.DataFrame(storage["slabs"]), use_container_width=True, hide_index=True)
+                st.caption(f"Tariff: **{cost_result['tariff']['name']}**, effective {cost_result['tariff']['effective_from']} "
+                           f"to {cost_result['tariff']['effective_to']}. Taxes extra (SOR 1.2(v)); bill rounded up to the next rupee (SOR 1.2(ix)).")
 
-                cst1.metric(
-                    "Wharfage / Box Charge",
-                    f"₹{wharfage.get('amount', 0) or 0:,.2f}",
-                )
+        # ── Checked against past data ──
+        validation = api_get("/cost/validation")
+        if validation:
+            vs = validation["summary"]
+            with st.expander(
+                f"🔎 Checked against past data — rates {vs['sor_items_consistent']}/{vs['sor_items_checked']} consistent "
+                f"with SOR 2022 · NMPA income {vs['income_lines_consistent']}/{vs['income_lines_checked']} lines explained · "
+                f"past calls cover {vs['calls_tonnage_coverage_pct']}% of reported tonnage"
+            ):
+                sor_chk = validation["past_tariff"]
+                st.markdown("**1 · Every rate vs the SOR general revision of Dec 2022.** NMPA indexes the SOR each "
+                            "1 May, so every item must move by the same few factors: "
+                            + ", ".join(f"{n} items × {f}" for f, n in sor_chk["factor_counts"].items())
+                            + (". No outliers." if not sor_chk["outliers"] else f". **{len(sor_chk['outliers'])} outliers — check.**"))
+                st.dataframe(pd.DataFrame(sor_chk["items"]), use_container_width=True, hide_index=True, height=240)
+                inc = validation["past_revenue"]
+                st.markdown("**2 · NMPA's own income (Revised Estimate 2023-24) ÷ tonnage handled vs the SOR band.**")
+                st.dataframe(pd.DataFrame([
+                    {"Line": c["line"], "Income (₹ Cr)": c["income_rs_crore"], "Tonnage (lakh t)": c["tonnes_lakh"],
+                     "Realised ₹/t": c["realised_rs_per_tonne"],
+                     "SOR band ₹/t": f"{c['sor_band_rs_per_tonne'][0]} – {c['sor_band_rs_per_tonne'][1]}",
+                     "Result": "Inside band" if c["inside_band"] else "Outside band (expected)" if c["result"] == "consistent" else "Outside band",
+                     "Why": c.get("explanation") or c["band_basis"]}
+                    for c in inc["cargo_lines"]
+                ]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(inc["vessel_ratio_checks"]), use_container_width=True, hide_index=True)
+                st.caption(inc["caveat"])
+                pcal = validation["past_calls"]
+                st.markdown(f"**3 · Tonnage of individual past calls vs NMPA's monthly traffic statement** "
+                            f"({pcal['months_compared'][0]} → {pcal['months_compared'][-1]}): "
+                            f"{pcal['calls_total_tonnes']:,} t vs {pcal['official_total_tonnes']:,} t reported "
+                            f"({pcal['coverage_pct']}%). Calls never exceed the official figure.")
+                st.dataframe(pd.DataFrame(pcal["by_group"]), use_container_width=True, hide_index=True)
+                st.caption("Sources: " + " · ".join(
+                    f"[{s['title']}]({s['url']})" if s.get("url") else s["title"]
+                    for s in {s["title"]: s for s in sor_chk["sources"] + inc["sources"]}.values()))
 
-                cst2.metric(
-                    "Berth Hire",
-                    f"₹{berth_hire.get('amount', 0) or 0:,.2f}",
-                )
-
-                cst3.metric(
-                    "Transit Storage",
-                    f"₹{storage.get('amount', 0) or 0:,.2f}",
-                )
-
-                cst4.metric(
-                    "Total Known Cost",
-                    f"₹{cost_result.get('total_known_cost', 0) or 0:,.2f}",
-                )
-
-                breakdown_rows = [
-                    {
-                        "Cost Component": "Wharfage / Container Box Charge",
-                        "Amount (₹)": wharfage.get("amount", 0) or 0,
-                    },
-                    {
-                        "Cost Component": "Berth Hire",
-                        "Amount (₹)": berth_hire.get("amount", 0) or 0,
-                    },
-                    {
-                        "Cost Component": "Transit Storage",
-                        "Amount (₹)": storage.get("amount", 0) or 0,
-                    },
-                ]
-
-                # Include any additional components returned by the backend.
-                for key, label in [
-                    ("reefer_electricity", "Reefer Electricity / Monitoring"),
-                    ("additional_charges", "Additional Known Charges"),
-                ]:
-                    if key in cost_result:
-                        breakdown_rows.append({
-                            "Cost Component": label,
-                            "Amount (₹)": cost_result.get(key, 0),
-                        })
-
-                st.dataframe(
-                    pd.DataFrame(breakdown_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                tariff_name = cost_result.get(
-                    "tariff_name",
-                    "NMPA Indexed Schedule of Rates",
-                )
-                effective_from = cost_result.get("effective_from", "01-05-2026")
-                effective_to = cost_result.get("effective_to", "30-04-2027")
-
-                st.caption(
-                    f"Tariff reference: **{tariff_name}** | "
-                    f"Effective: **{effective_from} to {effective_to}**"
-                )
-
-                st.info(
-                    "Known tariff components only. Final port billing may also depend on "
-                    "components not included in this estimator, such as pilotage, port dues, "
-                    "demurrage, labour/handling, crane charges, equipment charges, taxes, "
-                    "special cargo conditions, or other applicable SOR items."
-                )
-
-            elif cost_result and cost_result.get("detail"):
-                st.error(f"Cost calculation error: {cost_result['detail']}")
+        # ── Coming soon ──
+        coming_soon = (api_get("/cost/coming-soon") or {}).get("components", [])
+        if coming_soon:
+            with st.expander("🚧 Coming soon — SOR charges without published rates"):
+                st.caption("The 2026-27 SOR lists these charges but prints their rates as '*' or refers to "
+                           "another tariff. They are never estimated.")
+                for item in coming_soon:
+                    st.markdown(f"- **{item['label']}** (SOR {item['sor_reference']}) — *Coming soon*. {item['reason']}")
 
         st.markdown('</div>', unsafe_allow_html=True)
 

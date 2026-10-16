@@ -72,6 +72,7 @@ function renderTabContent(tabId) {
     case 'tab-vessels': renderVessels(); break;
     case 'tab-cargo-forecasting': renderCargoForecasting(); break;
     case 'tab-cargo-routing': renderCargoRouting(); break;
+    case 'tab-port-cost': renderPortCost(); break;
     case 'tab-trade': renderTrade(); break;
     case 'tab-anomaly': renderAnomaly(); break;
     case 'tab-incentive': renderIncentive(); break;
@@ -472,6 +473,401 @@ async function loadRoutingFacilities() {
   });
   html += `</tbody></table></div>`;
   document.getElementById('route-facilities-table').innerHTML = html;
+}
+
+// ─── TAB 4b: Port Cost & Tariff (NMPA SOR 2026-27) ──────────────────────────
+// Every number on this tab comes from the NMPA SOR 2026-27, a real past vessel
+// call in NMPA's Daily Vessel Position reports, or the user. Nothing is filled
+// with demo values: a missing input (e.g. GRT) is shown as missing, not guessed.
+function escHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function fmtINR(value) {
+  return "₹" + Number(value || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+const fmtUSD = v => "US$ " + Number(v || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtNum = (v, d = 0) => v == null ? "—" : Number(v).toLocaleString("en-IN", { maximumFractionDigits: d });
+
+let sorCommodities = [];
+let costMatchTimer = null;
+let pastCalls = [];
+let pastCallTimer = null;
+
+const COST_BERTHS = ["", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "SPM"];
+
+async function renderPortCost() {
+  const container = document.getElementById('tab-port-cost');
+  const num = (id, label, attrs = "", help = "") =>
+    `<div class="form-group"><label class="form-label">${label}</label><input type="number" id="${id}" ${attrs}>${help ? `<div style="font-size:11px;color:#78716C;margin-top:4px;">${help}</div>` : ""}</div>`;
+  container.innerHTML = `
+    <div class="sec-header">
+      <span class="sec-title">NMPA Port Cost & Tariff Calculator</span>
+      <span class="sec-tag">Real (NMPA SOR 2026-27 + past calls)</span>
+      <div class="sec-sub">Rates from the NMPA Indexed SOR w.e.f. 01-05-2026 · inputs from real vessel calls in NMPA's Daily Vessel Position reports · checked against SOR 2022 and NMPA's 2023-24 income</div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div style="font-size:11px;font-weight:800;color:#D97706;">START FROM A REAL PAST CALL</div>
+      <div class="grid-2" style="margin-top:8px;">
+        <div class="form-group"><label class="form-label">Search vessel, cargo, berth or receiver</label>
+          <input type="text" id="past-call-q" placeholder="e.g. IOF, LPG, KIOCL, SPM, VISHVA" oninput="schedulePastCallSearch()"></div>
+        <div class="form-group"><label class="form-label">Past call (newest first)</label>
+          <select id="past-call-select" onchange="loadPastCall(this.value)"><option value="">Loading calls…</option></select></div>
+      </div>
+      <div id="past-call-info" style="font-size:12px;color:#78716C;"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div style="font-size:11px;font-weight:800;color:#D97706;">CARGO</div>
+      <div class="grid-4" style="margin-top:8px;">
+        <div class="form-group">
+          <label class="form-label">Commodity (any name, NMPA code or SOR code)</label>
+          <input type="text" id="cost-commodity" list="cost-commodity-list" oninput="scheduleCostMatch()">
+          <datalist id="cost-commodity-list"></datalist>
+          <div id="cost-match" style="font-size:12px;margin-top:6px;color:#78716C;"></div>
+        </div>
+        ${num("cost-qty", "Quantity (MT, or CBM / units where the SOR says so)", 'min="0" step="any"')}
+        <div class="form-group"><label class="form-label">Cargo flow</label>
+          <select id="cost-flow" onchange="toggleCostTrade()">
+            <option value="import">Unloaded / Import (foreign cargo)</option>
+            <option value="export">Loaded / Export (foreign cargo)</option>
+            <option value="coastal">Coastal cargo</option>
+            <option value="transhipment">Transhipment</option>
+          </select></div>
+        <div class="form-group"><label class="form-label">Cargo trade (transhipment only)</label>
+          <select id="cost-trade" disabled><option value="foreign">Foreign</option><option value="coastal">Coastal</option></select></div>
+        <div class="form-group"><label class="form-label">Receiver / shipper</label><input type="text" id="cost-party" placeholder="needed for KIOCL / UPCL rules"></div>
+        ${num("cost-storage-days", "Days in transit storage", 'min="0" step="1"', "From the day after complete discharge (import) / receipt (export).")}
+        ${num("cost-holidays", "Customs holidays / non-working days in free period", 'min="0" step="1" value="0"', "They extend working-day free periods (SOR 3.2.1).")}
+        <div class="form-group"><label class="form-label">Storage category</label>
+          <select id="cost-category">
+            <option value="bulk">Bulk</option><option value="break_bulk">Break bulk</option>
+            <option value="salvaged">Salvaged goods (export)</option><option value="not_shipped">Export cargo not shipped</option>
+          </select></div>
+        ${num("cost-annual", "Annual volume MT (cement band only)", 'min="0" step="1000"')}
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div style="font-size:11px;font-weight:800;color:#D97706;">VESSEL</div>
+      <div class="grid-4" style="margin-top:8px;">
+        <div class="form-group"><label class="form-label">Vessel status (Customs / DGS)</label>
+          <select id="cost-vessel-run"><option value="foreign">Foreign-going (US$ rates)</option><option value="coastal">Coastal (₹ rates)</option></select></div>
+        <div class="form-group"><label class="form-label">Vessel type (berth hire class)</label>
+          <select id="cost-vessel">
+            <option value="dry_bulk">Dry bulk</option><option value="liquid">POL / liquid tanker</option>
+            <option value="hazardous">Hazardous cargo / chemicals</option>
+            <option value="container">Container</option><option value="general_cargo">General cargo / break bulk</option>
+            <option value="roro">RoRo / RoPax</option><option value="other">Other cargo vessel</option>
+            <option value="bunkering_at_berth">Calling only for bunkering at berth</option>
+            <option value="barge_tug_craft">Barge / tug / small craft</option><option value="bunker_barge">Bunker barge</option>
+            <option value="fishing_service_boat">Fishing / service boat</option>
+          </select></div>
+        ${num("cost-grt", "Vessel GRT (from tonnage certificate)", 'min="0" step="1" placeholder="required for vessel charges"')}
+        <div class="form-group"><label class="form-label">Berth</label>
+          <select id="cost-berth">${COST_BERTHS.map(b => `<option value="${b}">${b === "" ? "— not set —" : b === "SPM" ? "SPM (MRPL)" : "Berth " + b}</option>`).join("")}</select></div>
+        ${num("cost-berth-hours", "Berth hours (all fast → all lines cast off)", 'min="0" step="any"')}
+        ${num("cost-usd-inr", "USD → INR (RBI reference, entry day)", 'min="0" step="0.0001" placeholder="needed for foreign vessels"', 'Look it up on rbi.org.in for the day the vessel entered port limits.')}
+        ${num("cost-anchorage", "Anchorage hours after sailing", 'min="0" step="any" value="0"', "Pre-berthing anchorage is free.")}
+        ${num("cost-tug-hours", "Tug hours hired on request", 'min="0" step="any" value="0"', "Berthing tugs are part of pilotage.")}
+        ${num("cost-shifts", "Shiftings at vessel's request", 'min="0" step="1" value="0"')}
+        ${num("cost-bunkers", "Bunkers supplied (MT, SOR 3.7)", 'min="0" step="any" value="0"')}
+        <div class="form-group"><label class="form-label">Port dues concession (SOR 2.1.2)</label>
+          <select id="cost-pd-reduction">
+            <option value="none">None</option><option value="ballast_no_passengers">In ballast, no passengers (25%)</option>
+            <option value="no_cargo_no_passenger">No cargo / passengers handled (50%)</option>
+          </select></div>
+        <div class="form-group"><label class="form-label">Double banked?</label>
+          <select id="cost-double"><option value="false">No</option><option value="true">Yes (50% berth hire)</option></select></div>
+      </div>
+      <button class="btn" onclick="calculatePortCost()">Calculate NMPA Port Cost</button>
+    </div>
+
+    <div id="cost-output"></div>
+    <br>
+    <div class="card" style="margin-bottom:20px;" id="cost-validation">Loading checks against past data…</div>
+    <div class="card" style="margin-bottom:20px;">
+      <div style="font-family:Outfit;font-size:18px;font-weight:800;margin-bottom:6px;">🚧 Coming soon — SOR charges without published rates</div>
+      <div style="font-size:13px;color:#78716C;margin-bottom:12px;">The 2026-27 SOR lists these charges but prints their rates as "*" (as and when applicable) or refers to another tariff. They are never estimated.</div>
+      <div id="cost-coming-soon">Loading…</div>
+    </div>
+    <div class="card">
+      <div style="font-family:Outfit;font-size:18px;font-weight:800;margin-bottom:12px;">📋 SOR 3.1.1 Wharfage Schedule (₹ per unit)</div>
+      <input type="text" id="cost-schedule-filter" placeholder="Filter commodities…" oninput="renderSorSchedule()" style="margin-bottom:12px;">
+      <div id="cost-schedule">Loading schedule…</div>
+    </div>
+  `;
+
+  const [schedule, comingSoon] = await Promise.all([
+    fetchAPI('/cost/commodities'),
+    fetchAPI('/cost/coming-soon'),
+  ]);
+
+  sorCommodities = schedule?.commodities || [];
+  document.getElementById('cost-commodity-list').innerHTML = sorCommodities
+    .map(r => `<option value="${escHtml(r.code)}">${escHtml(r.item)}</option>`).join("");
+  renderSorSchedule();
+
+  const items = comingSoon?.components || [];
+  document.getElementById('cost-coming-soon').innerHTML = items.length
+    ? `<div class="table-container"><table><thead><tr><th>Charge</th><th>SOR Ref</th><th>Status</th><th>Why</th></tr></thead><tbody>${
+        items.map(i => `<tr><td><b>${escHtml(i.label)}</b></td><td>${escHtml(i.sor_reference)}</td><td><span class="badge badge-warning">Coming soon</span></td><td>${escHtml(i.reason)}</td></tr>`).join("")
+      }</tbody></table></div>`
+    : `<div class="alert-box alert-error">Could not load the coming-soon list from the backend.</div>`;
+
+  renderTariffValidation();
+  await searchPastCalls();
+  const first = document.getElementById('past-call-select')?.value;
+  if (first) await loadPastCall(first);
+}
+
+function renderSorSchedule() {
+  const el = document.getElementById('cost-schedule');
+  if (!el) return;
+  if (!sorCommodities.length) {
+    el.innerHTML = `<div class="alert-box alert-error">Could not load the SOR schedule from the backend.</div>`;
+    return;
+  }
+  const q = (document.getElementById('cost-schedule-filter')?.value || "").toLowerCase();
+  const rows = sorCommodities.filter(r => !q || `${r.code} ${r.group} ${r.item}`.toLowerCase().includes(q));
+  el.innerHTML = `<div class="table-container" style="max-height:420px;overflow:auto;"><table><thead><tr><th>Code</th><th>Group</th><th>Commodity</th><th>Unit</th><th>Coastal (₹)</th><th>Foreign (₹)</th></tr></thead><tbody>${
+    rows.map(r => `<tr><td><b>${escHtml(r.code)}</b></td><td>${escHtml(r.group)}</td><td>${escHtml(r.item)}</td><td>${escHtml(r.unit)}</td><td>${r.coastal.toFixed(2)}</td><td>${r.foreign.toFixed(2)}</td></tr>`).join("")
+  }</tbody></table></div>`;
+}
+
+function toggleCostTrade() {
+  const flow = document.getElementById('cost-flow').value;
+  document.getElementById('cost-trade').disabled = flow !== 'transhipment';
+}
+
+function scheduleCostMatch() {
+  clearTimeout(costMatchTimer);
+  costMatchTimer = setTimeout(updateCostMatch, 250);
+}
+
+async function updateCostMatch() {
+  const name = document.getElementById('cost-commodity')?.value.trim();
+  const el = document.getElementById('cost-match');
+  if (!el) return;
+  if (!name) { el.innerHTML = ""; return; }
+  const m = await fetchAPI(`/cost/match?name=${encodeURIComponent(name)}`);
+  if (!m) { el.innerHTML = `<span style="color:#991B1B;">Backend not reachable.</span>`; return; }
+  if (!m.code) { el.innerHTML = `<span style="color:#92400E;">⚠ ${escHtml(m.message)}</span>`; return; }
+  const text = `→ <b>${escHtml(m.code)}</b> ${escHtml(m.item)} <span style="opacity:.7">(${escHtml(m.method)}, ${m.score.toFixed(2)})</span>`;
+  el.innerHTML = m.needs_review
+    ? `<span style="color:#92400E;">⚠ ${text} — confirm the SOR line${m.ambiguity ? ": " + escHtml(m.ambiguity) : ""}</span>`
+    : text;
+}
+
+// ── Real past calls ──
+function schedulePastCallSearch() {
+  clearTimeout(pastCallTimer);
+  pastCallTimer = setTimeout(searchPastCalls, 300);
+}
+
+async function searchPastCalls() {
+  const sel = document.getElementById('past-call-select');
+  if (!sel) return;
+  const q = document.getElementById('past-call-q')?.value.trim() || "";
+  const data = await fetchAPI(`/cost/past-calls?limit=400&q=${encodeURIComponent(q)}`);
+  if (!data) { sel.innerHTML = `<option value="">Backend not reachable</option>`; return; }
+  pastCalls = data.calls || [];
+  sel.innerHTML = pastCalls.length
+    ? pastCalls.map(c => `<option value="${escHtml(c.id)}">${escHtml(c.berthing_date)} · ${escHtml(c.vessel)} · ${c.berth ? (c.berth === 'SPM' ? 'SPM' : 'B' + escHtml(c.berth)) : '—'} · ${escHtml(c.cargo_raw)} · ${fmtNum(c.quantity)} t</option>`).join("")
+    : `<option value="">No matching calls</option>`;
+  const s = data.summary || {};
+  document.getElementById('past-call-info').innerHTML =
+    `${fmtNum(data.count)} matching calls · archive ${escHtml(s.first_berthing)} → ${escHtml(s.last_berthing)} · ${fmtNum(s.with_quantity_and_sor_line)} cargo calls with quantity · source: NMPA Daily Vessel Position reports`;
+}
+
+async function loadPastCall(id) {
+  if (!id) return;
+  const d = await fetchAPI(`/cost/past-calls/${encodeURIComponent(id)}`);
+  if (!d) return;
+  const c = d.call, inp = d.calculator_inputs;
+  const set = (elId, v) => { const el = document.getElementById(elId); if (el) el.value = v ?? ""; };
+  set('cost-commodity', inp.cargo_type);
+  set('cost-qty', inp.cargo_quantity_mt);
+  set('cost-flow', inp.cargo_flow);
+  set('cost-trade', inp.trade_type);
+  set('cost-vessel-run', inp.vessel_trade_type);
+  set('cost-vessel', inp.vessel_type);
+  set('cost-grt', "");
+  set('cost-berth', COST_BERTHS.includes((inp.berth || "").toUpperCase()) ? inp.berth.toUpperCase() : (inp.berth || "").replace(/\D.*$/, ""));
+  set('cost-berth-hours', inp.berth_hours);
+  set('cost-party', inp.receiver_shipper);
+  set('cost-storage-days', "");
+  toggleCostTrade();
+  const conf = { exact: "exact movement times", date_only: "berthing / sailing date only", unconfirmed_lower_bound: "sailing not seen — lower bound" }[c.berth_hours_confidence] || "not linked";
+  document.getElementById('past-call-info').innerHTML = `
+    <b>${escHtml(c.vessel)}</b> · berthed ${escHtml(c.berthing_date)} at ${c.berth ? "Berth " + escHtml(c.berth) : "—"} · run <b>${escHtml(c.run_raw || "?")}</b> · LOA ${fmtNum(c.loa_m, 2)} m · agent ${escHtml(c.agent || "—")} · ${escHtml(c.receiver_shipper || "—")}<br>
+    Quantity: <b>${fmtNum(c.quantity)}</b> (${escHtml(c.quantity_basis || "not reported")}) · Berth hours: <b>${fmtNum(c.berth_hours, 2)}</b> (${conf}) · seen in reports ${escHtml(c.first_report)} → ${escHtml(c.last_report)}<br>
+    <span style="color:#92400E;">GRT is not in NMPA's daily reports — enter it from the vessel's tonnage certificate to price port dues, pilotage and berth hire.</span>`;
+  updateCostMatch();
+  calculatePortCost();
+}
+
+// ── Calculation ──
+async function calculatePortCost() {
+  const out = document.getElementById('cost-output');
+  if (!out) return;
+  const val = id => document.getElementById(id)?.value;
+  const numOrNull = id => { const v = parseFloat(val(id)); return Number.isFinite(v) && v > 0 ? v : null; };
+  const flow = val('cost-flow');
+  const trade = flow === 'coastal' ? 'coastal' : flow === 'transhipment' ? val('cost-trade') : 'foreign';
+
+  const payload = {
+    cargo_type: (val('cost-commodity') || "").trim(),
+    cargo_quantity_mt: numOrNull('cost-qty') || 0,
+    trade_type: trade,
+    vessel_trade_type: val('cost-vessel-run'),
+    cargo_flow: flow,
+    vessel_type: val('cost-vessel'),
+    vessel_grt: numOrNull('cost-grt'),
+    berth: val('cost-berth') || null,
+    berth_hours: numOrNull('cost-berth-hours') || 0,
+    storage_days: numOrNull('cost-storage-days') || 0,
+    excluded_days_in_free_period: numOrNull('cost-holidays') || 0,
+    cargo_category: val('cost-category'),
+    annual_volume_mt: numOrNull('cost-annual'),
+    usd_inr_rate: numOrNull('cost-usd-inr'),
+    receiver_shipper: (val('cost-party') || "").trim() || null,
+    port_dues_reduction: val('cost-pd-reduction'),
+    double_banked: val('cost-double') === 'true',
+    anchorage_hours: numOrNull('cost-anchorage') || 0,
+    tug_hire_hours: numOrNull('cost-tug-hours') || 0,
+    shifting_count: parseInt(val('cost-shifts') || "0", 10) || 0,
+    bunker_quantity_mt: numOrNull('cost-bunkers') || 0,
+  };
+  if (!payload.cargo_type) { out.innerHTML = `<div class="alert-box alert-warning">Pick a past call or enter a commodity.</div>`; return; }
+
+  out.innerHTML = `<div class="card">Calculating…</div>`;
+  let res, data;
+  try {
+    res = await fetch(`${API_BASE}/cost/calculate`, { method: 'POST', headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    data = await res.json();
+  } catch (err) {
+    out.innerHTML = `<div class="alert-box alert-error">Backend not reachable: ${escHtml(err.message)}</div>`;
+    return;
+  }
+  if (!res.ok) {
+    const d = data?.detail;
+    const msg = typeof d === 'string' ? d
+      : Array.isArray(d) ? d.map(e => `${(e.loc || []).slice(-1)[0]}: ${e.msg}`).join("; ")
+      : (d?.message || d?.error || JSON.stringify(d));
+    out.innerHTML = `<div class="alert-box alert-error">Cost calculation error: ${escHtml(msg)}</div>`;
+    return;
+  }
+  renderCostResult(data);
+}
+
+const COST_LABELS = {
+  wharfage: "Wharfage", transit_storage: "Transit storage", port_dues: "Port dues", pilotage: "Pilotage",
+  berth_hire: "Berth hire", anchorage: "Anchorage", tug_hire: "Tug hire", shifting: "Shifting",
+  bunkering_facility: "Bunkering facility",
+};
+const COST_STATUS = {
+  calculated: ["Calculated", "badge-normal"], needs_exchange_rate: ["Needs USD→INR", "badge-warning"],
+  needs_grt: ["Needs GRT", "badge-warning"], not_billed_by_nmpa: ["Not billed by NMPA", "badge-critical"],
+  not_applicable: ["Not applicable", "badge-normal"], rate_unavailable: ["Rate not published", "badge-warning"],
+};
+
+function renderCostResult(data) {
+  const out = document.getElementById('cost-output');
+  const b = data.breakdown || {};
+  const w = b.wharfage || {}, s = b.transit_storage || {};
+  const rule = s.free_days_rule || {};
+  const slabLabels = { week_1: "First week", week_2: "Second week", after_week_2: "Succeeding period", all_days: "All chargeable days (export)" };
+
+  const rows = Object.entries(b).map(([k, c]) => {
+    const [st, cls] = COST_STATUS[c.status] || [c.status, "badge-warning"];
+    const usd = c.amount_usd != null ? fmtUSD(c.amount_usd) : (c.reference_currency === "USD" && c.reference_amount != null ? `<span style="opacity:.6">${fmtUSD(c.reference_amount)} (ref.)</span>` : "—");
+    const inr = c.amount != null ? fmtINR(c.amount) : (c.reference_currency === "INR" && c.reference_amount != null ? `<span style="opacity:.6">${fmtINR(c.reference_amount)} (ref.)</span>` : "—");
+    const why = c.message || c.note || (c.chargeable_hours != null ? `${c.chargeable_hours} chargeable hours` : "");
+    return `<tr><td>${COST_LABELS[k] || escHtml(k)}</td><td>${escHtml(c.sor_reference || "")}</td><td><span class="badge ${cls}">${escHtml(st)}</span></td><td>${escHtml(c.currency || c.reference_currency || "")}</td><td>${usd}</td><td>${inr}</td><td style="font-size:12px;color:#78716C;">${escHtml(why)}</td></tr>`;
+  }).join("");
+
+  const warn = [];
+  (data.exceptions || []).forEach(e => warn.push(e.scope === 'note'
+    ? `<div class="alert-box alert-warning" style="margin-bottom:10px;">⚠ ${escHtml(e.message)}</div>`
+    : `<div class="alert-box alert-error" style="margin-bottom:10px;">⛔ ${escHtml(e.message)}</div>`));
+  if ((data.missing_grt_components || []).length)
+    warn.push(`<div class="alert-box alert-warning" style="margin-bottom:10px;">⚠ Not in the total: ${data.missing_grt_components.map(k => COST_LABELS[k] || k).join(", ")} — enter the vessel's GRT.</div>`);
+  if ((data.unconverted_usd_components || []).length)
+    warn.push(`<div class="alert-box alert-warning" style="margin-bottom:10px;">⚠ ${fmtUSD(data.unconverted_usd_total)} of foreign-vessel charges is not in the ₹ total — enter the RBI USD→INR reference rate for the vessel's entry day.</div>`);
+  (data.notes || []).forEach(n => warn.push(`<div class="alert-box alert-success" style="margin-bottom:10px;">ℹ ${escHtml(n)}</div>`));
+
+  out.innerHTML = `
+    <div class="grid-4" style="margin-bottom:20px;">
+      <div class="metric-card"><div class="metric-label">Wharfage</div><div class="metric-value">${w.amount != null ? fmtINR(w.amount) : "—"}</div></div>
+      <div class="metric-card"><div class="metric-label">Vessel related (₹)</div><div class="metric-value">${fmtINR(["port_dues", "pilotage", "berth_hire", "anchorage", "tug_hire", "shifting"].reduce((a, k) => a + (b[k]?.status === 'calculated' ? (b[k].amount || 0) : 0), 0))}</div></div>
+      <div class="metric-card"><div class="metric-label">Total known cost (₹)</div><div class="metric-value">${fmtINR(data.total_known_cost)}</div><div class="metric-delta" style="color:#78716C;">bill rounded: ₹${fmtNum(data.bill_total_rounded)} + GST</div></div>
+      <div class="metric-card"><div class="metric-label">Estimate status</div><div class="metric-value" style="font-size:20px;">${data.is_complete ? "✅ Complete" : "⚠ Partial"}</div><div class="metric-delta" style="color:#78716C;">${data.is_complete ? "all listed components priced" : "some inputs missing"}</div></div>
+    </div>
+    ${warn.join("")}
+    <div class="card" style="margin-bottom:20px;">
+      <div style="font-family:Outfit;font-size:18px;font-weight:800;margin-bottom:12px;">Cost breakdown</div>
+      <div class="table-container"><table><thead><tr><th>Component</th><th>SOR Ref</th><th>Status</th><th>Currency</th><th>Amount (US$)</th><th>Amount (₹)</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div style="font-size:12px;color:#78716C;margin-top:10px;">Tariff: <b>${escHtml(data.tariff?.name)}</b> · effective ${escHtml(data.tariff?.effective_from)} to ${escHtml(data.tariff?.effective_to)} · taxes extra (SOR 1.2(v)) · grand total rounded to the next rupee (SOR 1.2(ix)).</div>
+    </div>
+    <div class="grid-2" style="margin-bottom:20px;">
+      <div class="card">
+        <div style="font-size:11px;font-weight:800;color:#D97706;">WHARFAGE DETAIL (SOR 3.1.1)</div>
+        ${w.sor_code ? `<div style="font-weight:700;margin-top:6px;">${escHtml(w.sor_code)} — ${escHtml(w.sor_item)}</div>
+        <div style="margin-top:8px;">${fmtNum(w.chargeable_units, 1)} chargeable ${escHtml(w.unit)} × ₹${Number(w.rate_per_mt || 0).toFixed(2)} (${escHtml(w.trade_type)} cargo) = <b>${fmtINR(w.amount ?? w.reference_amount)}</b></div>` : `<div style="margin-top:6px;">${escHtml(w.message || "—")}</div>`}
+        ${(w.notes || []).map(n => `<div style="font-size:12px;color:#92400E;margin-top:4px;">⚠ ${escHtml(n)}</div>`).join("")}
+      </div>
+      <div class="card">
+        <div style="font-size:11px;font-weight:800;color:#D97706;">STORAGE (SOR 3.2.1)</div>
+        <div style="margin-top:6px;">${rule.status === 'configured'
+          ? `Free period: <b>${rule.free_storage_days}${rule.extended_by_non_working_days ? " + " + rule.extended_by_non_working_days : ""} days</b> — ${escHtml(rule.basis)} (SOR ${escHtml(rule.sor_reference)})`
+          : `No automatic free-period rule for this flow / category.`}</div>
+        <div style="margin-top:4px;">Chargeable days: <b>${s.chargeable_days ?? 0}</b></div>
+        ${(s.slabs || []).length
+          ? `<div class="table-container" style="margin-top:10px;"><table><thead><tr><th>Period</th><th>Days</th><th>₹ / unit / day</th><th>Amount</th></tr></thead><tbody>${
+              s.slabs.map(x => `<tr><td>${slabLabels[x.slab] || escHtml(x.slab)}</td><td>${x.days}</td><td>${x.rate_per_unit_day}</td><td>${fmtINR(x.amount)}</td></tr>`).join("")
+            }</tbody></table></div>`
+          : `<div style="margin-top:8px;color:#065F46;">No storage charge (within free period or no storage days entered).</div>`}
+      </div>
+    </div>`;
+}
+
+// ── Checks against past data ──
+async function renderTariffValidation() {
+  const el = document.getElementById('cost-validation');
+  const v = await fetchAPI('/cost/validation');
+  if (!el) return;
+  if (!v) { el.innerHTML = `<div class="alert-box alert-error">Could not load the validation report.</div>`; return; }
+  const sum = v.summary, sor = v.past_tariff, inc = v.past_revenue, calls = v.past_calls;
+  const factors = Object.entries(sor.factor_counts).map(([f, n]) => `${n} items × ${f}`).join(" · ");
+  const lines = inc.cargo_lines.map(c => `<tr><td><b>${escHtml(c.line)}</b><div style="font-size:11px;color:#78716C;">${c.ledger.map(escHtml).join("<br>")}</div></td><td>₹${c.income_rs_crore} Cr</td><td>${c.tonnes_lakh} lakh t</td><td><b>₹${c.realised_rs_per_tonne}</b></td><td>₹${c.sor_band_rs_per_tonne[0]} – ₹${c.sor_band_rs_per_tonne[1]}<div style="font-size:11px;color:#78716C;">${escHtml(c.band_basis)}</div></td><td><span class="badge ${c.result === 'consistent' ? 'badge-normal' : 'badge-critical'}">${c.inside_band ? "Inside band" : (c.result === 'consistent' ? "Outside band — expected" : "Outside band")}</span>${c.explanation ? `<div style="font-size:11px;color:#78716C;margin-top:4px;">${escHtml(c.explanation)}</div>` : ""}</td></tr>`).join("");
+  const ratios = inc.vessel_ratio_checks.map(r => `<tr><td>${escHtml(r.line)}</td><td>${r.ledger_ratio_pilotage_to_port_dues}</td><td>${r.sor_ratio}</td><td>${r.difference_pct}%</td><td style="font-size:11px;color:#78716C;">${escHtml(r.basis)}${r.explanation ? "<br>" + escHtml(r.explanation) : ""}</td></tr>`).join("");
+  const groups = calls.by_group.map(g => `<tr><td>${escHtml(g.section)}</td><td>${escHtml(g.group)}</td><td>${fmtNum(g.official_tonnes)}</td><td>${fmtNum(g.calls_tonnes)}</td><td>${g.coverage_pct == null ? "—" : g.coverage_pct + "%"}</td></tr>`).join("");
+  el.innerHTML = `
+    <div style="font-family:Outfit;font-size:18px;font-weight:800;margin-bottom:6px;">🔎 Checked against past data</div>
+    <div class="grid-3" style="margin:12px 0 16px;">
+      <div class="metric-card"><div class="metric-label">Rates vs SOR 2022</div><div class="metric-value">${sum.sor_items_consistent}/${sum.sor_items_checked}</div><div class="metric-delta" style="color:#78716C;">${escHtml(factors)}</div></div>
+      <div class="metric-card"><div class="metric-label">NMPA income 2023-24 vs SOR</div><div class="metric-value">${sum.income_lines_consistent}/${sum.income_lines_checked}</div><div class="metric-delta" style="color:#78716C;">realised ₹/t explained by SOR</div></div>
+      <div class="metric-card"><div class="metric-label">Past calls vs traffic statement</div><div class="metric-value">${sum.calls_tonnage_coverage_pct}%</div><div class="metric-delta" style="color:#78716C;">tonnage, ${escHtml(sum.months_compared[0])} → ${escHtml(sum.months_compared.slice(-1)[0])}</div></div>
+    </div>
+    <details open><summary style="cursor:pointer;font-weight:700;">1 · Every rate vs the SOR general revision of Dec 2022</summary>
+      <div style="font-size:13px;color:#78716C;margin:8px 0;">NMPA indexes the SOR each 1 May (SOR 1.2(xix)), so every rate must have moved by the same few factors since 2022. ${sor.outliers.length ? `<b style="color:#991B1B;">${sor.outliers.length} rate(s) do not — check them.</b>` : "No rate is out of line, so no transcription errors were found."}</div>
+      <div class="table-container" style="max-height:260px;overflow:auto;"><table><thead><tr><th>Item</th><th>SOR 2022</th><th>SOR 2026-27</th><th>Ratio</th></tr></thead><tbody>${
+        sor.items.map(i => `<tr><td>${escHtml(i.item)}</td><td>${i.sor_2022}</td><td>${i.sor_2026}</td><td>${i.ratio}${i.consistent ? "" : " ⚠"}</td></tr>`).join("")}</tbody></table></div>
+    </details>
+    <details open style="margin-top:14px;"><summary style="cursor:pointer;font-weight:700;">2 · NMPA's own income (Revised Estimate 2023-24) ÷ tonnage handled</summary>
+      <div class="table-container" style="margin-top:8px;"><table><thead><tr><th>Ledger line</th><th>Income</th><th>Tonnage</th><th>Realised ₹/t</th><th>SOR band</th><th>Result</th></tr></thead><tbody>${lines}</tbody></table></div>
+      <div class="table-container" style="margin-top:10px;"><table><thead><tr><th>Vessel charges</th><th>Pilotage ÷ port dues (ledger)</th><th>Same ratio in SOR</th><th>Diff.</th><th>Basis</th></tr></thead><tbody>${ratios}</tbody></table></div>
+      <div style="font-size:12px;color:#78716C;margin-top:6px;">${escHtml(inc.caveat)}</div>
+    </details>
+    <details style="margin-top:14px;"><summary style="cursor:pointer;font-weight:700;">3 · Tonnage of individual past calls vs NMPA's monthly traffic statement</summary>
+      <div style="font-size:13px;color:#78716C;margin:8px 0;">${fmtNum(calls.calls_total_tonnes)} t from individual calls vs ${fmtNum(calls.official_total_tonnes)} t reported. Calls never exceed the official figure; the gap is days missing from the report archive and calls without a quantity. ${escHtml(calls.note)}</div>
+      <div class="table-container"><table><thead><tr><th>Section</th><th>Commodity</th><th>NMPA statement (t)</th><th>Sum of calls (t)</th><th>Coverage</th></tr></thead><tbody>${groups}</tbody></table></div>
+    </details>
+    <div style="font-size:11px;color:#78716C;margin-top:12px;">Sources: ${[...new Set([...sor.sources, ...inc.sources].map(s => s.url ? `<a href="${escHtml(s.url)}" target="_blank" rel="noopener">${escHtml(s.title)}</a>` : escHtml(s.title)))].join(" · ")}</div>`;
 }
 
 // ─── TAB 5: Trade Intelligence Renderer ──────────────────────────────────────
